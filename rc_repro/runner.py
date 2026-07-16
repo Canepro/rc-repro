@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
+import yaml
+
 from rc_repro import config
 
 
@@ -66,7 +68,68 @@ def write(name: str, compose_yaml: str, meta: Metadata,
 
 def read_meta(name: str) -> Metadata:
     blob = json.loads((workspace(name) / "repro.json").read_text(encoding="utf-8"))
+    if "bind_host" not in blob:
+        blob["bind_host"] = _legacy_bind_host(name, int(blob["host_port"]))
     return Metadata(**blob)
+
+
+def _published_bind(port: object, host_port: int) -> str | None:
+    """Return the bind address when a Compose port publishes host_port."""
+    if isinstance(port, dict):
+        published = port.get("published")
+        try:
+            matches = int(published) == host_port
+        except (TypeError, ValueError):
+            return None
+        if not matches:
+            return None
+        return str(port.get("host_ip") or "0.0.0.0")
+
+    if not isinstance(port, (str, int)):
+        return None
+    value = str(port).split("/", 1)[0]
+    parts = value.rsplit(":", 2)
+    if len(parts) == 1:
+        return None
+    published = parts[-2]
+    try:
+        matches = int(published) == host_port
+    except ValueError:
+        return None
+    if not matches:
+        return None
+    if len(parts) == 2:
+        return "0.0.0.0"
+    return parts[0].strip("[]") or "0.0.0.0"
+
+
+def _legacy_bind_host(name: str, host_port: int) -> str:
+    """Infer a legacy repro's bind without inventing a loopback guarantee."""
+    try:
+        doc = yaml.safe_load(
+            (workspace(name) / "docker-compose.yml").read_text(encoding="utf-8")
+        )
+    except (OSError, yaml.YAMLError):
+        return "unknown"
+    services = doc.get("services", {}) if isinstance(doc, dict) else {}
+    if not isinstance(services, dict):
+        return "unknown"
+    binds = set()
+    for service in services.values():
+        if not isinstance(service, dict):
+            continue
+        ports = service.get("ports", [])
+        if not isinstance(ports, list):
+            continue
+        for port in ports:
+            bind = _published_bind(port, host_port)
+            if bind is not None:
+                binds.add(bind)
+    if "0.0.0.0" in binds:
+        return "0.0.0.0"
+    if len(binds) == 1:
+        return binds.pop()
+    return "unknown"
 
 
 def image_ref(meta: Metadata) -> str:

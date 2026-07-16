@@ -446,11 +446,15 @@ def test_bind_host_preserves_ephemeral_host_port_semantics():
     ]
 
 
-def test_read_meta_defaults_new_fields_for_existing_repros(monkeypatch, tmp_path):
+def test_read_meta_infers_unbound_legacy_compose(monkeypatch, tmp_path):
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(runner, "docker_available", lambda: False)
     workspace = runner.workspace("old")
     workspace.mkdir(parents=True)
-    (workspace / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+    (workspace / "docker-compose.yml").write_text(
+        "services:\n  rocketchat:\n    ports:\n      - '3000:3000'\n",
+        encoding="utf-8",
+    )
     (workspace / "repro.json").write_text(
         json.dumps(
             {
@@ -471,8 +475,99 @@ def test_read_meta_defaults_new_fields_for_existing_repros(monkeypatch, tmp_path
 
     meta = runner.read_meta("old")
     assert meta.rc_tag == ""
-    assert meta.bind_host == "127.0.0.1"
+    assert meta.bind_host == "0.0.0.0"
     assert runner.image_ref(meta).endswith(":8.4.1")
+    assert runner.evidence("old")["repro"]["bind_address"] == "0.0.0.0"
+
+
+def test_read_meta_infers_loopback_legacy_compose(monkeypatch, tmp_path):
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(runner, "docker_available", lambda: False)
+    workspace = runner.workspace("loopback")
+    workspace.mkdir(parents=True)
+    (workspace / "docker-compose.yml").write_text(
+        "services:\n  rocketchat:\n    ports:\n      - '127.0.0.1:3000:3000'\n",
+        encoding="utf-8",
+    )
+    (workspace / "repro.json").write_text(
+        json.dumps(
+            {
+                "name": "loopback",
+                "project": "rcrepro-loopback",
+                "rc_version": "8.5.1",
+                "rc_image": "registry.rocket.chat/rocketchat/rocket.chat",
+                "mongo_tag": "8.0",
+                "mongo_flavor": "official",
+                "preset": "default",
+                "root_url": "http://localhost:3000",
+                "host_port": 3000,
+                "version_source": "builtin",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert runner.read_meta("loopback").bind_host == "127.0.0.1"
+    assert runner.evidence("loopback")["repro"]["bind_address"] == "127.0.0.1"
+
+
+def test_legacy_bind_never_hides_a_public_mapping(monkeypatch, tmp_path):
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    workspace = runner.workspace("mixed")
+    workspace.mkdir(parents=True)
+    (workspace / "docker-compose.yml").write_text(
+        "services:\n"
+        "  private:\n"
+        "    ports: ['127.0.0.1:3000:3000']\n"
+        "  public:\n"
+        "    ports: ['3000:3000']\n",
+        encoding="utf-8",
+    )
+    (workspace / "repro.json").write_text(
+        json.dumps(
+            {
+                "name": "mixed",
+                "project": "rcrepro-mixed",
+                "rc_version": "8.5.1",
+                "rc_image": "registry.rocket.chat/rocketchat/rocket.chat",
+                "mongo_tag": "8.0",
+                "mongo_flavor": "official",
+                "preset": "default",
+                "root_url": "http://localhost:3000",
+                "host_port": 3000,
+                "version_source": "builtin",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert runner.read_meta("mixed").bind_host == "0.0.0.0"
+
+
+def test_read_meta_marks_unprovable_legacy_bind_unknown(monkeypatch, tmp_path):
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    workspace = runner.workspace("unknown")
+    workspace.mkdir(parents=True)
+    (workspace / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+    (workspace / "repro.json").write_text(
+        json.dumps(
+            {
+                "name": "unknown",
+                "project": "rcrepro-unknown",
+                "rc_version": "8.5.1",
+                "rc_image": "registry.rocket.chat/rocketchat/rocket.chat",
+                "mongo_tag": "8.0",
+                "mongo_flavor": "official",
+                "preset": "default",
+                "root_url": "http://localhost:3000",
+                "host_port": 3000,
+                "version_source": "builtin",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert runner.read_meta("unknown").bind_host == "unknown"
 
 
 def test_evidence_omits_free_form_metadata_and_sanitizes_root_url(monkeypatch, tmp_path):

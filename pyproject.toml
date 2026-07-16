@@ -22,7 +22,12 @@ dev = ["pytest>=7"]
 rc-repro = "rc_repro.cli:app"
 
 [tool.setuptools]
-packages = ["rc_repro", "rc_repro.presets"]
+packages = [
+    "rc_repro",
+    "rc_repro.data",
+    "rc_repro.data.presets",
+    "rc_repro.presets",
+]
 
 [tool.setuptools.package-data]
 rc_repro = ["data/*.yaml", "data/presets/*.yaml"]
