@@ -401,6 +401,154 @@ def test_version_single_source():
     assert rc_repro.__version__ and rc_repro.__version__ != "0.0.0-dev"
 
 
+def test_compose_uses_independent_rc_image_tag():
+    spec = _spec("8.4.1")
+    spec.rc_image = "ghcr.io/rocketchat/rocket.chat"
+    spec.rc_tag = "pr-12345"
+    doc = compose.build(spec)
+    assert doc["services"]["rocketchat"]["image"] == (
+        "ghcr.io/rocketchat/rocket.chat:pr-12345"
+    )
+
+
+def test_bind_host_overrides_existing_short_and_long_host_ips():
+    doc = {
+        "services": {
+            "sidecar": {
+                "ports": [
+                    "0.0.0.0:9001:9001/tcp",
+                    {
+                        "target": 8080,
+                        "published": 8080,
+                        "host_ip": "0.0.0.0",
+                    },
+                ]
+            }
+        }
+    }
+    compose._bind_ports(doc, "127.0.0.1")
+    assert doc["services"]["sidecar"]["ports"] == [
+        "127.0.0.1:9001:9001/tcp",
+        {
+            "target": 8080,
+            "published": 8080,
+            "host_ip": "127.0.0.1",
+        },
+    ]
+
+
+def test_bind_host_preserves_ephemeral_host_port_semantics():
+    doc = {"services": {"sidecar": {"ports": ["8080", "9090/udp"]}}}
+    compose._bind_ports(doc, "127.0.0.1")
+    assert doc["services"]["sidecar"]["ports"] == [
+        "127.0.0.1::8080",
+        "127.0.0.1::9090/udp",
+    ]
+
+
+def test_read_meta_defaults_new_fields_for_existing_repros(monkeypatch, tmp_path):
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    workspace = runner.workspace("old")
+    workspace.mkdir(parents=True)
+    (workspace / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+    (workspace / "repro.json").write_text(
+        json.dumps(
+            {
+                "name": "old",
+                "project": "rcrepro-old",
+                "rc_version": "8.4.1",
+                "rc_image": "registry.rocket.chat/rocketchat/rocket.chat",
+                "mongo_tag": "8.0",
+                "mongo_flavor": "official",
+                "preset": "default",
+                "root_url": "http://localhost:3000",
+                "host_port": 3000,
+                "version_source": "fallback",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    meta = runner.read_meta("old")
+    assert meta.rc_tag == ""
+    assert meta.bind_host == "127.0.0.1"
+    assert runner.image_ref(meta).endswith(":8.4.1")
+
+
+def test_evidence_omits_free_form_metadata_and_sanitizes_root_url(monkeypatch, tmp_path):
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path))
+    monkeypatch.setattr(runner, "docker_available", lambda: False)
+    minio = presets.load("s3_minio")
+    assert any("rcrepro-secret" in note for note in minio.notes)
+    meta = runner.Metadata(
+        name="proof",
+        project="rcrepro-proof",
+        rc_version="8.4.1",
+        rc_image="ghcr.io/rocketchat/rocket.chat",
+        mongo_tag="8.0",
+        mongo_flavor="official",
+        preset="default",
+        root_url="http://token-value@localhost:3000/private/token?secret=yes#credential",
+        host_port=3000,
+        version_source="fallback",
+        rc_tag="pr-12345",
+        bind_host="127.0.0.1",
+        extra={
+            "api_token": "must-not-leak",
+            "notes": minio.notes,
+            "nested": [{"password": "must-not-leak", "scenario": "uploads"}],
+        },
+    )
+    runner.write("proof", "services: {}\n", meta)
+
+    record = runner.evidence("proof")
+    assert record["schema"] == "rc-repro.evidence.v1"
+    assert record["repro"]["image_ref"].endswith(":pr-12345")
+    assert record["repro"]["bind_address"] == "127.0.0.1"
+    assert record["repro"]["root_url"] == "http://localhost:3000"
+    assert "extra" not in record["repro"]
+    serialized = json.dumps(record)
+    assert "must-not-leak" not in serialized
+    assert "rcrepro-secret" not in serialized
+    assert "token-value" not in serialized
+    assert "secret=yes" not in serialized
+    assert record["runtime"]["docker_available"] is False
+    assert record["runtime"]["images"] == []
+    assert len(record["compose_sha256"]) == 64
+
+
+def test_ps_includes_stopped_services(monkeypatch):
+    seen = []
+
+    def fake_compose(name, *args, **kwargs):
+        seen.append((name, args, kwargs))
+
+        class Result:
+            returncode = 0
+            stdout = "rocketchat\texited\tExited (0)\n"
+
+        return Result()
+
+    monkeypatch.setattr(runner, "_compose", fake_compose)
+    assert runner.ps("stopped") == "rocketchat\texited\tExited (0)\n"
+    assert seen == [
+        (
+            "stopped",
+            ("ps", "--all", "--format", "{{.Service}}\t{{.State}}\t{{.Status}}"),
+            {"capture": True},
+        )
+    ]
+    assert runner.rc_state("stopped") == "exited"
+
+
+def test_compose_version_supports_current_and_future_majors():
+    assert runner.compose_version_supported("v2.40.3")
+    assert runner.compose_version_supported("5.3.0")
+    assert not runner.compose_version_supported("1.29.2")
+    assert not runner.compose_version_supported("unknown")
+    assert not runner.compose_version_supported(None)
+
+
 # --- seed ---------------------------------------------------------------------
 
 

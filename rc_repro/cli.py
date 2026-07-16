@@ -7,6 +7,7 @@ import re
 import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 import requests
@@ -183,9 +184,19 @@ def _pick_host_port(port: int, pre: presets.Preset, exclude: str = "") -> int:
         _err(str(exc))
 
 
-def _print_plan(repro_name: str, resolved, pre: presets.Preset, root: str, token: str) -> None:
+def _print_plan(
+    repro_name: str,
+    resolved,
+    pre: presets.Preset,
+    root: str,
+    token: str,
+    image_tag: str,
+) -> None:
     typer.echo(f"Reproduction {repro_name!r}")
-    typer.echo(f"  Rocket.Chat : {resolved.rc_image}:{resolved.rc_version}")
+    image_line = f"{resolved.rc_image}:{image_tag}"
+    if image_tag != resolved.rc_version:
+        image_line += f" (base version {resolved.rc_version})"
+    typer.echo(f"  Rocket.Chat : {image_line}")
     typer.echo(
         f"  MongoDB     : {resolved.mongo_tag} ({resolved.mongo_flavor}) via {resolved.source}"
     )
@@ -208,6 +219,9 @@ def up(
     root_url: str = typer.Option("", "--root-url", help="override ROOT_URL"),
     bind: str = typer.Option("", "--bind", help="host interface for published ports (default 127.0.0.1 — local only). 0.0.0.0 exposes RC AND sidecars with well-known credentials to your whole network — use deliberately"),
     rc_image: str = typer.Option("", "--rc-image", help="override the RC image repo"),
+    rc_tag: str = typer.Option(
+        "", "--rc-tag", help="override the RC image tag (for example pr-12345)"
+    ),
     mongo: str = typer.Option("", "--mongo", help="override the resolved MongoDB tag"),
     reg_token: str = typer.Option("", "--reg-token", help="cloud registration token (EE license)"),
     set_: list[str] = typer.Option(None, "--set", help="preset parameter KEY=VALUE (repeatable), e.g. --set users=5"),
@@ -231,6 +245,7 @@ def up(
     # Image override precedence: --rc-image flag > config/env (RC_REPRO_RC_IMAGE).
     if rc_image or cfg.get("rc_image"):
         resolved.rc_image = rc_image or cfg["rc_image"]
+    image_tag = rc_tag or resolved.rc_version
     if mongo:
         versions.apply_mongo_override(resolved, mongo)
 
@@ -273,6 +288,7 @@ def up(
         preset=pre,
         bind_host=bind_host,
     )
+    spec.rc_tag = image_tag
     doc = compose.build(spec)
 
     meta = runner.Metadata(
@@ -288,6 +304,8 @@ def up(
         version_source=resolved.source,
         pinned=pin,
         created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        rc_tag=image_tag,
+        bind_host=bind_host,
     )
     if pre.post_ready:
         meta.extra["post_ready"] = pre.post_ready
@@ -316,7 +334,7 @@ def up(
         raw["default_repro"] = repro_name
         config.save_config(raw)
 
-    _print_plan(repro_name, resolved, pre, root, token)
+    _print_plan(repro_name, resolved, pre, root, token, image_tag)
 
     rc = runner.up(repro_name, pull=not no_pull)
     if rc != 0:
@@ -629,6 +647,8 @@ def info(name: str = typer.Option("", "--name", "-n")) -> None:
     m = runner.read_meta(target)
     typer.echo(f"Repro   : {m.name}  (RC {m.rc_version}, mongo {m.mongo_tag}/{m.mongo_flavor})")
     typer.echo(f"URL     : {m.root_url}")
+    typer.echo(f"Image   : {runner.image_ref(m)}")
+    typer.echo(f"Bind    : {m.bind_host}")
     typer.echo(f"Admin   : {config.ADMIN_USERNAME} / {config.ADMIN_PASSWORD}")
     typer.echo(f"Preset  : {m.preset}")
     _print_workspace(m)
@@ -641,6 +661,29 @@ def info(name: str = typer.Option("", "--name", "-n")) -> None:
         typer.echo("")
         for line in notes:
             ui.note(line)
+
+
+@app.command()
+def evidence(
+    name: str = typer.Option("", "--name", "-n"),
+    output: str = typer.Option(
+        "-", "--output", "-o", help="JSON file path, or - for stdout"
+    ),
+    json_output: bool = typer.Option(False, "--json", help="emit the stable JSON evidence record"),
+) -> None:
+    """Export a redacted, machine-readable reproduction record."""
+    # JSON is the only supported evidence format. The flag makes that contract
+    # explicit for callers that always request machine-readable output.
+    del json_output
+    target = _resolve_name(name)
+    text = json.dumps(runner.evidence(target), indent=2, sort_keys=True)
+    if output == "-":
+        typer.echo(text)
+        return
+    path = Path(output).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text + "\n", encoding="utf-8")
+    typer.echo(str(path))
 
 
 @app.command()
@@ -797,8 +840,8 @@ def doctor() -> None:
 
     # docker compose v2
     cv = runner.compose_version()
-    if cv and cv.lstrip("v")[:1] == "2":
-        line("ok", f"docker compose v2 ({cv})")
+    if runner.compose_version_supported(cv):
+        line("ok", f"docker compose v2+ ({cv})")
     elif cv:
         line("warn", f"docker compose {cv} — rc-repro expects Compose v2")
     else:

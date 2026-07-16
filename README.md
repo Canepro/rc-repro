@@ -84,6 +84,7 @@ That's the whole loop: **`up` → use it → `down`**.
 ```bash
 rc-repro list                     # all repros: version, port, state, URL
 rc-repro info   --name test       # URL, admin creds, handy snippets
+rc-repro evidence --name test --json  # redacted runtime record for support tooling
 rc-repro logs   --name test -f    # tail logs (attach to a ticket)
 rc-repro ready  --name test       # block until it's serving (if you didn't use --wait)
 ```
@@ -144,6 +145,23 @@ rc-repro up --version 8.5.1 --preset email --set verification=true      # requir
 rc-repro up --version 8.5.1 --preset s3_minio                           # files stored in MinIO instead of GridFS
 rc-repro up --version 8.5.1 --preset s3_minio --set presigned=true      # real presigned URLs (needs hosts entry)
 ```
+
+Use a first-party PR image without retagging it, while keeping every published
+port private on a remote host:
+
+```bash
+rc-repro up \
+  --version 8.5.1 \
+  --rc-image ghcr.io/rocketchat/rocket.chat \
+  --rc-tag pr-12345 \
+  --bind 127.0.0.1 \
+  --name pr-12345 \
+  --wait
+```
+
+`--version` still selects the compatible MongoDB version. `--rc-tag` only
+changes the Rocket.Chat image tag. `--bind` applies to Rocket.Chat and
+every sidecar UI published by the selected preset.
 
 For `ldap`, `saml` and `oidc`, log in as **`user1` / `user1`** (…`userN` / `userN`).
 
@@ -253,6 +271,7 @@ rc-repro api --name test --2fa  POST /api/v1/settings/<id> -d '{"value":true}'
 | `use <name>` | set the default repro for name-less commands |
 | `list` | all repros: version, port, state, URL |
 | `info` | URL, admin creds, snippets, preset notes |
+| `evidence` | redacted JSON with version, image identity, runtime state, and compose hash |
 | `token` / `api` / `pat` | REST auth + calls |
 | `seed` | populate a repro with sample users/channels/messages |
 | `logs` | tail a repro's logs |
@@ -262,6 +281,12 @@ rc-repro api --name test --2fa  POST /api/v1/settings/<id> -d '{"value":true}'
 | `prune` | delete all `down` repros |
 
 Run `rc-repro <command> --help` for flags.
+
+`rc-repro evidence --name <name> --json` is the support-tool handoff. It omits
+admin credentials and free-form preset metadata, reduces the root URL to its
+origin, records created container image IDs when Docker is available, and is
+safe to redirect into an evidence folder. Review the output before sharing it
+outside the support workflow.
 
 ## 9. How version → MongoDB resolution works
 

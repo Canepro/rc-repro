@@ -287,20 +287,38 @@ def build(spec: Spec) -> dict:
 
 
 def _bind_ports(doc: dict, bind: str) -> None:
-    """Prefix every published port with the bind host, unless one is already
-    given. Applied to ALL services in one pass — RC, multi-instance direct
-    ports, the load balancer, and preset sidecars — mirroring the official
-    rocketchat-compose `${BIND_IP}:${HOST_PORT}:${PORT}` pattern."""
+    """Bind every published service port to one host address.
+
+    Apply the address after preset merging so custom presets cannot bypass the
+    selected host with an existing short-syntax prefix or long-syntax host_ip.
+    """
     if not bind:
         return
     for svc in doc["services"].values():
         ports = svc.get("ports")
-        if not ports:
+        if not isinstance(ports, list):
             continue
-        svc["ports"] = [
-            f"{bind}:{p}" if str(p).split(":", 1)[0].isdigit() else str(p)
-            for p in ports
-        ]
+        bound = []
+        for port in ports:
+            if isinstance(port, dict):
+                item = copy.deepcopy(port)
+                item["host_ip"] = bind
+                bound.append(item)
+                continue
+            value = str(port)
+            base, separator, protocol = value.rpartition("/")
+            if not separator:
+                base = value
+                protocol = ""
+            fields = base.split(":")
+            if len(fields) >= 2:
+                published, target = fields[-2:]
+            else:
+                published = ""
+                target = fields[0]
+            suffix = f"/{protocol}" if protocol else ""
+            bound.append(f"{bind}:{published}:{target}{suffix}")
+        svc["ports"] = bound
 
 
 def to_yaml(doc: dict) -> str:

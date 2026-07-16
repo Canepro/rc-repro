@@ -6,13 +6,16 @@ generated docker-compose.yml and a repro.json metadata file.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import socket
 import subprocess
 import sys
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from rc_repro import config
 
@@ -31,6 +34,8 @@ class Metadata:
     version_source: str
     pinned: bool = False
     created_at: str = ""
+    rc_tag: str = ""
+    bind_host: str = config.DEFAULT_BIND_HOST
     extra: dict = field(default_factory=dict)
 
 
@@ -62,6 +67,77 @@ def write(name: str, compose_yaml: str, meta: Metadata,
 def read_meta(name: str) -> Metadata:
     blob = json.loads((workspace(name) / "repro.json").read_text(encoding="utf-8"))
     return Metadata(**blob)
+
+
+def image_ref(meta: Metadata) -> str:
+    return f"{meta.rc_image}:{meta.rc_tag or meta.rc_version}"
+
+
+def _safe_root_origin(value: str) -> str:
+    """Return only the HTTP(S) origin, excluding userinfo, path and query data."""
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        port = parsed.port
+    except (UnicodeError, ValueError):
+        return "REDACTED"
+    if parsed.scheme not in {"http", "https"} or not hostname:
+        return "REDACTED"
+    if ":" in hostname:
+        hostname = f"[{hostname}]"
+    netloc = f"{hostname}:{port}" if port is not None else hostname
+    return f"{parsed.scheme}://{netloc}"
+
+
+def evidence(name: str) -> dict:
+    """Return a stable, secret-safe reproduction record."""
+    meta = read_meta(name)
+    compose_file = workspace(name) / "docker-compose.yml"
+    digest = hashlib.sha256(compose_file.read_bytes()).hexdigest()
+    docker_up = docker_available()
+    services = []
+    runtime_images = []
+    state = "unknown"
+    if docker_up:
+        state = rc_state(name)
+        for line in ps(name).splitlines():
+            parts = line.split("\t", 2)
+            services.append(
+                {
+                    "service": parts[0],
+                    "state": parts[1] if len(parts) > 1 else "unknown",
+                    "status": parts[2] if len(parts) > 2 else "",
+                }
+            )
+        runtime_images = images(name)
+    return {
+        "schema": "rc-repro.evidence.v1",
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "repro": {
+            "name": meta.name,
+            "project": meta.project,
+            "rc_version": meta.rc_version,
+            "image_ref": image_ref(meta),
+            "mongo_tag": meta.mongo_tag,
+            "mongo_flavor": meta.mongo_flavor,
+            "preset": meta.preset,
+            "root_url": _safe_root_origin(meta.root_url),
+            "host_port": meta.host_port,
+            "bind_address": meta.bind_host,
+            "version_source": meta.version_source,
+            "created_at": meta.created_at,
+            "pinned": meta.pinned,
+        },
+        "runtime": {
+            "state": state,
+            "services": services,
+            "images": runtime_images,
+            "docker_available": docker_up,
+            "docker_version": docker_server_version() if docker_up else None,
+            "compose_version": compose_version() if docker_up else None,
+        },
+        "compose_sha256": digest,
+    }
 
 
 def list_meta() -> list[Metadata]:
@@ -213,9 +289,54 @@ def compose_exec(name: str, service: str, args: list[str]) -> int:
 def ps(name: str) -> str:
     """Return `docker compose ps` for a repro (service/state/status lines)."""
     proc = _compose(
-        name, "ps", "--format", "{{.Service}}\t{{.State}}\t{{.Status}}", capture=True
+        name,
+        "ps",
+        "--all",
+        "--format",
+        "{{.Service}}\t{{.State}}\t{{.Status}}",
+        capture=True,
     )
     return proc.stdout or ""
+
+
+def images(name: str) -> list[dict[str, str]]:
+    """Return safe image identity fields for a repro's created containers."""
+    proc = _compose(name, "images", "--format", "json", capture=True)
+    if proc.returncode != 0:
+        return []
+    raw = (proc.stdout or "").strip()
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+        records = parsed if isinstance(parsed, list) else [parsed]
+    except json.JSONDecodeError:
+        records = []
+        for line in raw.splitlines():
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+    result = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        result.append(
+            {
+                "container": str(
+                    record.get("Container")
+                    or record.get("ContainerName")
+                    or record.get("Service")
+                    or ""
+                ),
+                "repository": str(record.get("Repository") or ""),
+                "tag": str(record.get("Tag") or ""),
+                "image_id": str(record.get("ID") or record.get("ImageID") or ""),
+                "size": str(record.get("Size") or ""),
+            }
+        )
+    return result
 
 
 def rc_state(name: str) -> str:
@@ -294,3 +415,13 @@ def docker_server_version() -> str | None:
 
 def compose_version() -> str | None:
     return _first_line(["docker", "compose", "version", "--short"])
+
+
+def compose_version_supported(version: str | None) -> bool:
+    """Return whether a detected Compose version satisfies the v2+ contract."""
+    if not version:
+        return False
+    try:
+        return int(version.lstrip("v").split(".", 1)[0]) >= 2
+    except ValueError:
+        return False
