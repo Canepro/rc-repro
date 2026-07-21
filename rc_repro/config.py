@@ -37,7 +37,12 @@ PRESET_PORTS: dict[str, tuple[int, ...]] = {
     "oidc": (8085,),          # Keycloak (OIDC; same port inside+out)
     "email": (8025,),         # Mailpit web UI / API
     "s3_minio": (9000, 9001), # MinIO S3 API + console
+    "livechat": (8090,),      # demo "customer website" embedding the widget
 }
+
+# Host ports for the --monitor add-on (Prometheus, Grafana). Not a preset, so
+# kept separate from PRESET_PORTS but treated the same for collision checks.
+MONITOR_PORTS: tuple[int, int] = (9090, 5050)
 
 # Host interface published ports bind to. Loopback: repros use weak fixed
 # credentials, so they should not be reachable from the local network unless
@@ -52,6 +57,10 @@ MONGO_OPLOG_URL = "mongodb://mongodb:27017/local?replicaSet=rs0"
 # Key under Metadata.extra where the email preset records Mailpit's URL, so
 # rcapi.login can fetch email-2FA codes for rc-repro's own admin calls.
 EXTRA_MAILPIT_URL = "mailpit_url"
+
+# RC's REST rate limiter — disabled for the duration of a load test (and the
+# seed) so the offered load isn't throttled into a false result, then restored.
+RC_RATE_LIMITER_SETTING = "API_Enable_Rate_Limiter"
 
 # Environment overrides for config.yaml values (env wins over the file):
 #   RC_REPRO_REG_TOKEN  -> reg_token     RC_REPRO_RC_IMAGE -> rc_image
@@ -76,6 +85,11 @@ def repros_dir() -> Path:
 
 def preset_dir() -> Path:
     return home() / "presets"
+
+
+def reports_dir() -> Path:
+    """Where benchmark/perf reports are written by default."""
+    return home() / "reports"
 
 
 def config_file() -> Path:

@@ -122,15 +122,17 @@ def login(
 
     # Ask RC to (re)send the code, then fish it out of Mailpit. Filter by the
     # recipient so a code for another user (Mailpit is a catch-all inbox for
-    # every address) is never picked up by mistake.
+    # every address) is never picked up by mistake, and snapshot the inbox first
+    # so a leftover code from a previous login isn't mistaken for the fresh one.
+    to_email = user if "@" in user else (
+        config.ADMIN_EMAIL if user == config.ADMIN_USERNAME else None
+    )
+    baseline = newest_mail_stamp(mailpit_url, to_email=to_email)
     requests.post(
         f"{base}/users.2fa.sendEmailCode",
         json={"emailOrUsername": user}, timeout=timeout,
     )
-    to_email = user if "@" in user else (
-        config.ADMIN_EMAIL if user == config.ADMIN_USERNAME else None
-    )
-    code = fetch_email_otp(mailpit_url, to_email=to_email)
+    code = fetch_email_otp(mailpit_url, to_email=to_email, after=baseline)
     if not code:
         raise RuntimeError("email-2FA code did not arrive in Mailpit within the timeout")
     resp3 = requests.post(
@@ -154,13 +156,31 @@ def _addressed_to(item: dict, to_email: str | None) -> bool:
     return to_email.lower() in (a.lower() for a in addrs)
 
 
+def newest_mail_stamp(mailpit_url: str, to_email: str | None = None) -> str:
+    """The `Created` timestamp of the newest message (optionally addressed to
+    `to_email`), or "" if none. Snapshot this BEFORE triggering a new code so
+    fetch_email_otp can ignore stale codes still sitting in the catch-all inbox."""
+    base = mailpit_url.rstrip("/")
+    try:
+        r = requests.get(f"{base}/api/v1/messages", params={"limit": 10}, timeout=5)
+        if r.status_code == 200:
+            for item in r.json().get("messages") or []:   # newest first
+                if _addressed_to(item, to_email):
+                    return item.get("Created") or ""
+    except (requests.RequestException, ValueError):
+        pass
+    return ""
+
+
 def fetch_email_otp(
     mailpit_url: str, to_email: str | None = None,
-    timeout: float = 30.0, interval: float = 1.5,
+    timeout: float = 30.0, interval: float = 1.5, after: str = "",
 ) -> str | None:
     """Poll Mailpit's API for the newest message (optionally only those addressed
     to `to_email` — Mailpit is a catch-all inbox for every user) and extract a
-    6-digit code. Returns None if no code shows up within `timeout`.
+    6-digit code. `after` (a `newest_mail_stamp` snapshot) skips any message not
+    newer than it, so a code left over from a previous login is never reused.
+    Returns None if no code shows up within `timeout`.
     """
     base = mailpit_url.rstrip("/")
     deadline = time.monotonic() + timeout
@@ -172,6 +192,8 @@ def fetch_email_otp(
                     mid = item.get("ID")
                     if not mid or not _addressed_to(item, to_email):
                         continue
+                    if after and (item.get("Created") or "") <= after:
+                        continue   # stale — predates the code we just requested
                     msg = requests.get(f"{base}/api/v1/message/{mid}", timeout=5)
                     if msg.status_code != 200:
                         continue
@@ -226,7 +248,15 @@ def generate_pat(
         json={"tokenName": token_name, "bypassTwoFactor": bypass_2fa},
         timeout=timeout,
     )
-    j = r.json()
+    def _json(resp) -> dict:
+        # A 5xx/HTML/empty body must fall through to the RuntimeError below, not
+        # escape as a raw JSONDecodeError.
+        try:
+            return resp.json()
+        except ValueError:
+            return {}
+
+    j = _json(r)
     if j.get("success") and j.get("token"):
         return j["token"]
     # Already exists → regenerate it (also 2FA-guarded).
@@ -236,10 +266,40 @@ def generate_pat(
         json={"tokenName": token_name},
         timeout=timeout,
     )
-    j2 = r2.json()
+    j2 = _json(r2)
     if j2.get("success") and j2.get("token"):
         return j2["token"]
     raise RuntimeError(f"could not create PAT: {r.text[:200]}")
+
+
+def create_incoming_webhook(root_url: str, auth: Auth, password: str,
+                            channel: str = "#general",
+                            name: str = "rc-repro-loadtest-hook",
+                            timeout: float = 15.0) -> str | None:
+    """Create (or reuse) an incoming-webhook integration and return its POST path
+    (/hooks/<id>/<token>), or None. Used by the loadtest `webhook` scenario."""
+    base = f"{root_url.rstrip('/')}/api/v1"
+    hdr = {**auth.headers(), "Content-Type": "application/json", **password_2fa_headers(password)}
+    payload = {
+        "type": "webhook-incoming", "name": name, "enabled": True,
+        "username": "rocket.cat", "channel": channel, "scriptEnabled": False,
+        "script": "", "alias": "loadtest", "avatar": "", "emoji": "",
+    }
+    try:
+        r = requests.post(f"{base}/integrations.create", headers=hdr, json=payload, timeout=timeout)
+        if r.status_code == 200 and r.json().get("success"):
+            i = r.json()["integration"]
+            return f"/hooks/{i['_id']}/{i['token']}"
+        # Likely already exists from a previous run — find it by name.
+        r2 = requests.get(f"{base}/integrations.list", headers=hdr,
+                          params={"count": 100}, timeout=timeout)
+        if r2.status_code == 200:
+            for i in r2.json().get("integrations") or []:
+                if i.get("name") == name and i.get("token"):
+                    return f"/hooks/{i['_id']}/{i['token']}"
+    except (requests.RequestException, ValueError, KeyError):
+        pass
+    return None
 
 
 def get_setting(root_url: str, auth: Auth, password: str, setting_id: str, timeout: float = 15.0):
@@ -270,6 +330,23 @@ def set_setting(root_url: str, auth: Auth, password: str, setting_id: str, value
         return False
 
 
+def _method_succeeded(resp) -> bool:
+    """Whether a /api/v1/method.call response reflects a SUCCESSFUL method run.
+
+    method.call returns HTTP 200 with top-level `success: true` even when the
+    Meteor method itself threw — the real outcome is a JSON-encoded string in the
+    `message` field (`{"msg":"result", ..., "error": {...}}` on failure). So the
+    outer flag alone reports false success; the inner envelope must be checked."""
+    try:
+        body = resp.json()
+        if resp.status_code != 200 or body.get("success") is not True:
+            return False
+        inner = json.loads(body.get("message") or "{}")
+    except (ValueError, TypeError):
+        return False
+    return "error" not in inner
+
+
 def add_oauth_service(root_url: str, auth: Auth, password: str, name: str, timeout: float = 15.0) -> bool:
     """Create a Custom OAuth provider via RC's `addOAuthService` method.
 
@@ -283,6 +360,134 @@ def add_oauth_service(root_url: str, auth: Auth, password: str, name: str, timeo
         resp = requests.post(
             f"{root_url.rstrip('/')}/api/v1/method.call/addOAuthService",
             headers=headers, json={"message": msg}, timeout=timeout,
+        )
+        return _method_succeeded(resp)
+    except (requests.RequestException, ValueError):
+        return False
+
+
+def _method_call(root_url: str, auth: Auth, password: str, method: str, params: list, timeout: float = 15.0) -> bool:
+    """Invoke a Meteor method over REST (method.call). Returns True on success."""
+    headers = {**auth.headers(), "Content-Type": "application/json", **password_2fa_headers(password)}
+    msg = json.dumps({"msg": "method", "id": "1", "method": method, "params": params})
+    try:
+        resp = requests.post(
+            f"{root_url.rstrip('/')}/api/v1/method.call/{method}",
+            headers=headers, json={"message": msg}, timeout=timeout,
+        )
+        return _method_succeeded(resp)
+    except (requests.RequestException, ValueError):
+        return False
+
+
+def create_user(root_url: str, auth: Auth, password: str, username: str, timeout: float = 15.0) -> bool:
+    """Create a verified user (idempotent-ish: an existing username just fails)."""
+    headers = {**auth.headers(), "Content-Type": "application/json", **password_2fa_headers(password)}
+    try:
+        resp = requests.post(
+            f"{root_url.rstrip('/')}/api/v1/users.create", headers=headers,
+            json={"name": username.capitalize(), "username": username,
+                  "email": f"{username}@example.com", "password": username,
+                  "verified": True, "requirePasswordChange": False},
+            timeout=timeout,
+        )
+        return resp.status_code == 200 and resp.json().get("success") is True
+    except (requests.RequestException, ValueError):
+        return False
+
+
+def add_livechat_agent(root_url: str, auth: Auth, password: str, username: str, timeout: float = 15.0) -> bool:
+    """Make `username` an Omnichannel agent (assigns the livechat-agent role)."""
+    headers = {**auth.headers(), "Content-Type": "application/json", **password_2fa_headers(password)}
+    try:
+        resp = requests.post(
+            f"{root_url.rstrip('/')}/api/v1/livechat/users/agent",
+            headers=headers, json={"username": username}, timeout=timeout,
+        )
+        return resp.ok
+    except (requests.RequestException, ValueError):
+        return False
+
+
+def get_user_id(root_url: str, auth: Auth, username: str, timeout: float = 15.0) -> str | None:
+    """Resolve a username to its _id via users.info, or None."""
+    try:
+        r = requests.get(
+            f"{root_url.rstrip('/')}/api/v1/users.info",
+            params={"username": username}, headers=auth.headers(), timeout=timeout,
+        )
+        if r.ok:
+            return (r.json().get("user") or {}).get("_id")
+    except (requests.RequestException, ValueError):
+        pass
+    return None
+
+
+def ensure_livechat_department(root_url: str, auth: Auth, password: str, name: str, timeout: float = 15.0) -> str | None:
+    """Create (or find, if it already exists) an Omnichannel department; return
+    its id. The create schema is strict — only these department fields, no
+    agents (assign those separately via assign_livechat_agents)."""
+    base = f"{root_url.rstrip('/')}/api/v1"
+    hdr = {**auth.headers(), "Content-Type": "application/json", **password_2fa_headers(password)}
+    body = {"department": {"enabled": True, "name": name, "email": f"{name}@example.com",
+                           "showOnRegistration": True, "showOnOfflineForm": True}}
+    try:
+        r = requests.post(f"{base}/livechat/department", headers=hdr, json=body, timeout=timeout)
+        b = r.json()
+        if b.get("success"):
+            return (b.get("department") or {}).get("_id")
+        # Already exists (or strict-schema reject) — look it up by name.
+        # count=0 -> all departments, so a match past the default page isn't missed.
+        existing = requests.get(f"{base}/livechat/department", headers=hdr,
+                                params={"count": 0}, timeout=timeout).json()
+        for d in existing.get("departments", []):
+            if d.get("name") == name:
+                return d.get("_id")
+    except (requests.RequestException, ValueError):
+        pass
+    return None
+
+
+def assign_livechat_agents(root_url: str, auth: Auth, password: str, dept_id: str,
+                           agents: list[dict], timeout: float = 15.0) -> bool:
+    """Assign agents (list of {agentId, username}) to a department. Idempotent."""
+    hdr = {**auth.headers(), "Content-Type": "application/json", **password_2fa_headers(password)}
+    upsert = [{"agentId": a["agentId"], "username": a["username"], "count": 0, "order": 0} for a in agents]
+    try:
+        r = requests.post(
+            f"{root_url.rstrip('/')}/api/v1/livechat/department/{dept_id}/agents",
+            headers=hdr, json={"upsert": upsert, "remove": []}, timeout=timeout,
+        )
+        return r.ok
+    except (requests.RequestException, ValueError):
+        return False
+
+
+def save_canned_response(root_url: str, auth: Auth, password: str, shortcut: str,
+                         text: str, timeout: float = 15.0) -> bool:
+    """Save a global canned response. This is an ENTERPRISE feature — returns
+    False on Community (403), so callers treat it as best-effort."""
+    hdr = {**auth.headers(), "Content-Type": "application/json", **password_2fa_headers(password)}
+    try:
+        r = requests.post(
+            f"{root_url.rstrip('/')}/api/v1/canned-responses",
+            headers=hdr, json={"shortcut": shortcut, "text": text, "scope": "global"},
+            timeout=timeout,
+        )
+        return r.status_code == 200 and r.json().get("success") is True
+    except (requests.RequestException, ValueError):
+        return False
+
+
+def set_livechat_available(root_url: str, auth: Auth, password: str, timeout: float = 15.0) -> bool:
+    """Set the logged-in agent available for Omnichannel. Note: the workspace
+    only shows as "online" to visitors once that agent also has a live presence
+    (i.e. is logged into the RC UI) — this just flips the availability flag."""
+    headers = {**auth.headers(), "Content-Type": "application/json", **password_2fa_headers(password)}
+    try:
+        resp = requests.post(
+            f"{root_url.rstrip('/')}/api/v1/livechat/agent.status",
+            headers=headers, json={"status": "available"}, timeout=timeout,
         )
         return resp.status_code == 200 and resp.json().get("success") is True
     except (requests.RequestException, ValueError):

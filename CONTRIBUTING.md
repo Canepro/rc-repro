@@ -22,16 +22,18 @@ CI runs `pytest` on every push/PR (see `.github/workflows/ci.yml`).
 | `rc_repro/presets/` | preset package: `__init__.py` holds the `Preset` dataclass + loader |
 | `rc_repro/presets/_common.py` | shared `--set` param helpers (`truthy_param`/`int_param`/`str_param`) |
 | `rc_repro/presets/_keycloak.py` | shared Keycloak scaffolding reused by `saml` + `oidc` |
-| `rc_repro/presets/ldap.py`, `saml.py`, `oidc.py`, `email.py`, `s3_minio.py` | generate the LDAP / Keycloak (SAML & OIDC) / Mailpit / MinIO scenarios |
+| `rc_repro/presets/ldap.py`, `saml.py`, `oidc.py`, `email.py`, `s3_minio.py`, `livechat.py` | generate the LDAP / Keycloak (SAML & OIDC) / Mailpit / MinIO / Omnichannel scenarios |
 | `rc_repro/presets/multi_instance.py` | generate the multi-instance (Traefik + NATS) scenario |
 | `rc_repro/compose.py` | build the docker-compose document (incl. cloning RC into N instances, port binding) |
 | `rc_repro/runner.py` | on-disk state, `docker compose` invocations, host-port allocation |
 | `rc_repro/rcapi.py` | minimal Rocket.Chat REST client (readiness, auth, 2FA/OTP, settings) |
 | `rc_repro/seed.py` | populate a repro with sample users/channels/messages via REST |
+| `rc_repro/monitoring.py` | `--monitor` add-on: Prometheus + Grafana services/config, attachable to any repro |
+| `rc_repro/perf/` | performance tooling: `timings` (latency percentiles), `resources` (docker-stats sampler), `k6` (load-test runner), `slo` (SLO gate parse/evaluate), `baseline` (saved runs + before/after compare), `constrain` (customer-sized CPU/RAM caps), `rcmetrics` (RC /metrics sampler: event-loop lag), `mongoprof` (Mongo slow-query capture), `timeline` (latency-over-time + spike recovery), `verdict` (rule-based diagnosis), `report` (benchmark/loadtest/capacity markdown) |
 | `rc_repro/ui.py` | terminal output helpers (`ok`/`warn`/`fail`/`note`/`die`) |
 | `rc_repro/config.py` | paths, constants, `PRESET_PORTS` registry, env-var overrides, persisted config |
 | `rc_repro/__init__.py` | `__version__` (single-sourced from `pyproject.toml` via `importlib.metadata`) |
-| `rc_repro/data/` | shipped version map + static preset YAML |
+| `rc_repro/data/` | shipped version map, static preset YAML, monitoring dashboard JSON, k6 load-test scripts (`data/loadtest/`) |
 
 ## Adding a preset
 

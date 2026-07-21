@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import json
+import os
+import platform
 import re
+import shutil
 import sys
+import textwrap
 import time
+from dataclasses import asdict as dc_asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -13,8 +18,10 @@ from typing import Optional
 import requests
 import typer
 
-from rc_repro import compose, config, presets, rcapi, runner, ui, versions
+from rc_repro import compose, config, configimport, presets, perf, rcapi, runner, scaleseed, ui, versions
 from rc_repro import seed as seeder
+from rc_repro.perf import report as perf_report
+from rc_repro.perf.timings import fmt_ms
 
 app = typer.Typer(
     add_completion=False,
@@ -96,6 +103,24 @@ def _check_sidecar_ports(pre: presets.Preset, exclude: str = "") -> None:
             _err(f"preset {pre.name!r} needs host port {p}, which is already in use on this machine")
 
 
+def _check_monitor_ports(exclude: str = "") -> None:
+    """Preflight the Prometheus/Grafana ports for --monitor / attach."""
+    wanted = set(config.MONITOR_PORTS)
+    own: set[int] = set()
+    for m in runner.list_meta():
+        claimed = set(m.extra.get("monitoring_ports") or []) if isinstance(m.extra, dict) else set()
+        if m.name == exclude:
+            own = claimed
+            continue
+        overlap = sorted(claimed & wanted)
+        if overlap:
+            _err(f"monitoring needs port(s) {overlap}, already used by repro {m.name!r} "
+                 f"(its monitoring) — stop it first: rc-repro monitor --name {m.name} --off")
+    for p in sorted(wanted - own):
+        if not runner.port_free(p):
+            _err(f"monitoring needs host port {p}, which is already in use on this machine")
+
+
 def _pretty_state(status: str) -> str:
     """Friendly label from a `docker compose ls` status.
 
@@ -123,7 +148,14 @@ def _parse_set_params(set_: list[str] | None) -> dict[str, str]:
     return params
 
 
-def _reuse_existing(repro_name: str, wait: bool, seed: bool, seed_profile: str) -> None:
+def _unknown_params(params: dict, pre: presets.Preset) -> list[str]:
+    """`--set` keys the preset doesn't accept (typos like `agent` for `agents`
+    were silently ignored before). Known keys = the preset's params_help."""
+    return sorted(set(params) - set(pre.params_help))
+
+
+def _reuse_existing(repro_name: str, wait: bool, seed: bool, seed_profile: str,
+                    monitor: bool = False, stats: bool = False) -> None:
     """The idempotent `up` path for an existing repro: `docker compose up -d`
     handles both a `stop`-paused repro (containers exist -> started) and a
     `down`ed one (containers removed, volume kept -> recreated with its data).
@@ -136,10 +168,12 @@ def _reuse_existing(repro_name: str, wait: bool, seed: bool, seed_profile: str) 
         if runner.up(repro_name, pull=False) != 0:
             _err("`docker compose up` failed (see output above)")
     typer.echo("  (creation flags like --set/--bind/--port are ignored on an existing repro; --force recreates)")
+    if monitor:
+        ui.hint(f"  add monitoring to this running repro: rc-repro monitor --name {repro_name}")
     meta = runner.read_meta(repro_name)
     _post_up(meta, wait)
     if seed:
-        _run_seed(meta, seed_profile)
+        _run_seed(meta, seed_profile, stats=stats)
 
 
 def _own_ports(name: str) -> set[int]:
@@ -155,9 +189,10 @@ def _own_ports(name: str) -> set[int]:
     n = m.extra.get("instances") if isinstance(m.extra, dict) else None
     if isinstance(n, int) and n > 1:
         own.update(m.host_port + i for i in range(1, n + 1))
-    side = m.extra.get("sidecar_ports") if isinstance(m.extra, dict) else None
-    if isinstance(side, list):
-        own.update(int(p) for p in side if isinstance(p, int) or str(p).isdigit())
+    for key in ("sidecar_ports", "monitoring_ports"):
+        claimed = m.extra.get(key) if isinstance(m.extra, dict) else None
+        if isinstance(claimed, list):
+            own.update(int(p) for p in claimed if isinstance(p, int) or str(p).isdigit())
     return own
 
 
@@ -192,19 +227,55 @@ def _print_plan(
     token: str,
     image_tag: str,
 ) -> None:
-    typer.echo(f"Reproduction {repro_name!r}")
-    image_line = f"{resolved.rc_image}:{image_tag}"
-    if image_tag != resolved.rc_version:
-        image_line += f" (base version {resolved.rc_version})"
-    typer.echo(f"  Rocket.Chat : {image_line}")
+    # Compact one-liner before the (possibly slow) image pull; the full summary
+    # panel is shown once the repro is ready. A custom image tag (e.g. --rc-tag
+    # pr-12345) is surfaced here so it isn't hidden behind the base RC version.
+    tag_note = "" if image_tag == resolved.rc_version else f" (image tag {image_tag})"
     typer.echo(
-        f"  MongoDB     : {resolved.mongo_tag} ({resolved.mongo_flavor}) via {resolved.source}"
+        f"Creating {repro_name!r} — RC {resolved.rc_version}{tag_note}, "
+        f"Mongo {resolved.mongo_tag} ({resolved.mongo_flavor}), preset {pre.name}…"
     )
-    typer.echo(f"  Preset      : {pre.name} ({pre.source})")
-    typer.echo(f"  URL         : {root}")
     if pre.requires_license and not token:
-        ui.warn("  note        : this preset needs an Enterprise license — pass --reg-token.")
-    typer.echo("")
+        ui.warn("  note: this preset needs an Enterprise license — pass --reg-token.")
+
+
+def _fmt_duration(secs: int) -> str:
+    """Human duration: 42s, 1m03s."""
+    return f"{secs}s" if secs < 60 else f"{secs // 60}m{secs % 60:02d}s"
+
+
+# Map the non-ASCII punctuation that shows up in preset descriptions to ASCII —
+# em/en dashes, ellipsis, curly quotes, arrows etc. are East-Asian "ambiguous"
+# width and render double-wide in some terminals, breaking box alignment.
+_ASCII_MAP = str.maketrans({
+    "—": "-", "–": "-", "…": "...", "’": "'", "‘": "'",
+    "“": '"', "”": '"', "→": "->", "←": "<-", "·": "-", " ": " ",
+})
+
+
+def _ascii(text: str) -> str:
+    return text.translate(_ASCII_MAP)
+
+
+def _summary_panel(meta: runner.Metadata, extra_rows: list[tuple[str, str]] | None = None) -> None:
+    """The boxed repro summary (URL + login + versions), shared by up/ready/info,
+    followed by multi-instance URLs. Title is the repro name only — kept pure
+    ASCII so box-drawing alignment can't be thrown off by wide/emoji glyphs
+    (status like "✓ ready" is printed on its own line by the caller)."""
+    rows = [
+        ("Rocket.Chat", meta.rc_version),
+        ("MongoDB", f"{meta.mongo_tag} ({meta.mongo_flavor})"),
+        ("Preset", meta.preset),
+        ("URL", meta.root_url),
+        ("Login", f"{config.ADMIN_USERNAME} / {config.ADMIN_PASSWORD}"),
+    ]
+    rows += extra_rows or []
+    ui.panel(meta.name, rows)
+    n = meta.extra.get("instances")
+    if n:
+        ui.hint(f"  instances ({n}, load-balanced by Traefik):")
+        for i in range(1, int(n) + 1):
+            ui.hint(f"    rocketchat-{i}: http://localhost:{meta.host_port + i}")
 
 
 # --- commands -----------------------------------------------------------------
@@ -233,6 +304,8 @@ def up(
     no_pull: bool = typer.Option(False, "--no-pull", help="don't pull images first"),
     fresh: bool = typer.Option(False, "--fresh", help="wipe this repro's volume first"),
     force: bool = typer.Option(False, "--force", help="overwrite an existing repro"),
+    monitor: bool = typer.Option(False, "--monitor", help="also add Prometheus + Grafana (RC metrics dashboard)"),
+    stats: bool = typer.Option(False, "--stats", help="with --seed: report the CPU/RAM cost of seeding"),
 ) -> None:
     """Create and start a version-matched Rocket.Chat repro."""
     _require_docker()
@@ -249,10 +322,15 @@ def up(
     if mongo:
         versions.apply_mongo_override(resolved, mongo)
 
+    params = _parse_set_params(set_)
     try:
-        pre = presets.load(preset, _parse_set_params(set_))
+        pre = presets.load(preset, params)
     except ValueError as exc:
         _err(str(exc))
+    unknown = _unknown_params(params, pre)
+    if unknown:
+        valid = ", ".join(sorted(pre.params_help)) or "(this preset takes no --set params)"
+        _err(f"unknown --set param(s) for preset {preset!r}: {', '.join(unknown)} — valid: {valid}")
 
     # Post-ready preset actions (e.g. Keycloak SAML) and --seed both need RC to
     # be serving first, so imply --wait for them.
@@ -269,10 +347,12 @@ def up(
     # Idempotent: an existing repro (unless --fresh/--force recreates it) is
     # simply brought back up with its data intact.
     if runner.exists(repro_name) and not force and not fresh:
-        _reuse_existing(repro_name, wait, seed, seed_profile)
+        _reuse_existing(repro_name, wait, seed, seed_profile, monitor=monitor, stats=stats)
         return
 
     _check_sidecar_ports(pre, exclude=repro_name)
+    if monitor:
+        _check_monitor_ports(exclude=repro_name)
     host_port = _pick_host_port(port, pre, exclude=repro_name)
     root = root_url or f"http://localhost:{host_port}"
     token = reg_token or cfg.get("reg_token") or ""
@@ -287,6 +367,7 @@ def up(
         reg_token=token or None,
         preset=pre,
         bind_host=bind_host,
+        monitoring=monitor,
     )
     spec.rc_tag = image_tag
     doc = compose.build(spec)
@@ -317,6 +398,15 @@ def up(
         meta.extra.update(pre.extra)
     if pre.ports:
         meta.extra["sidecar_ports"] = pre.ports
+    files = list(pre.files)
+    if monitor:
+        from rc_repro import monitoring
+        targets = compose.rc_service_names(pre.instances)
+        files += monitoring.files(targets)
+        meta.extra["monitoring"] = True
+        meta.extra["monitoring_ports"] = list(config.MONITOR_PORTS)
+        meta.extra.setdefault("notes", [])
+        meta.extra["notes"] = list(meta.extra["notes"]) + monitoring.notes()
 
     # Recreate (--force/--fresh): tear the OLD release down BEFORE overwriting
     # its compose file — the old file still describes the running services, so
@@ -325,7 +415,7 @@ def up(
         if runner.down(repro_name, volumes=fresh) != 0:
             _err(f"could not tear down the existing {repro_name!r} (see output above); not overwriting it")
 
-    runner.write(repro_name, compose.to_yaml(doc), meta, files=pre.files)
+    runner.write(repro_name, compose.to_yaml(doc), meta, files=files)
 
     if pin:
         # Persist into the FILE only — never the env-merged view (with_env
@@ -346,11 +436,11 @@ def up(
 
     _post_up(meta, wait)
     if seed:
-        _run_seed(meta, seed_profile)
+        _run_seed(meta, seed_profile, stats=stats)
 
 
 def _run_seed(meta: runner.Metadata, profile: str,
-              users=None, channels=None, messages=None) -> None:
+              users=None, channels=None, messages=None, stats: bool = False) -> None:
     try:
         auth = _login(meta)
     except Exception as exc:  # noqa: BLE001
@@ -363,41 +453,146 @@ def _run_seed(meta: runner.Metadata, profile: str,
         f"Seeding {meta.name!r} (profile: {profile} — {plan.users} users, "
         f"{plan.channels} channels, {plan.messages} msgs/channel)…"
     )
-    s = seeder.seed(meta.root_url, auth, plan, log=lambda m: typer.echo(f"  {m}"))
-    ui.ok(
-        f"✓ seeded: {s['users']} users, {s['channels']} channels, "
-        f"~{s['messages']} messages, {s['dms']} DMs"
-    )
+    mon = perf.ResourceMonitor(meta.name).start() if stats else None
+    t0 = time.monotonic()
+    try:
+        s = seeder.seed(meta.root_url, auth, plan, log=lambda m: typer.echo(f"  {m}"))
+    finally:
+        resources = mon.stop() if mon else None   # stop the sampler thread even if seed raises
+    total = time.monotonic() - t0
+    _print_seed_result(s, total, resources, meta)
+
+
+def _scale_result(out: str) -> dict | None:
+    """Last JSON line from a scaleseed mongosh run (banners may precede it)."""
+    for line in reversed((out or "").strip().splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                return json.loads(line)
+            except ValueError:
+                continue
+    return None
+
+
+def _run_scale(meta: runner.Metadata, spec_str: str) -> None:
+    try:
+        spec = scaleseed.parse_scale(spec_str)
+    except ValueError as exc:
+        _err(str(exc))
+    if not spec:
+        _err("--scale had nothing to do (want users=N and/or messages=N@room)")
+    ui.warn("bulk Mongo prefill: users are credential-less and messages fire no "
+            "app hooks — for scale/perf repros, not feature testing.")
+    if "users" in spec:
+        typer.echo(f"Inserting {spec['users']:,} users…")
+        res = _scale_ok(*scaleseed.bulk_users(meta.name, spec["users"]), "user prefill")
+        ui.ok(f"✓ inserted {res.get('inserted', 0):,} users")
+    if "messages" in spec:
+        n, room = spec["messages"]
+        typer.echo(f"Inserting {n:,} messages into {room!r}…")
+        res = _scale_ok(*scaleseed.bulk_messages(meta.name, n, room), "message prefill",
+                        hint="create the room first (REST seed, or use `general`)")
+        ui.ok(f"✓ inserted {res.get('inserted', 0):,} messages into {room!r}")
+
+
+def _scale_ok(rc: int, out: str, what: str, *, hint: str = "") -> dict:
+    """Validate a scaleseed mongosh result: non-zero exit / no JSON => hard fail;
+    a JS-level {error} (surfaced on stdout by scaleseed._eval) => report it."""
+    res = _scale_result(out)
+    if rc != 0 or not res:
+        _err(f"{what} failed (is mongodb up?): {out.strip()[:200]}")
+    if res.get("error"):
+        _err(f"{what} failed: {res['error']}" + (f" — {hint}" if hint else ""))
+    return res
+
+
+def _clear_scale(meta: runner.Metadata) -> None:
+    res = _scale_ok(*scaleseed.clear(meta.name), "clear")
+    ui.ok(f"✓ removed {res.get('users', 0):,} scale users and "
+          f"{res.get('messages', 0):,} scale messages")
+
+
+def _short_container(full: str, repro_name: str, keep_index: bool = False) -> str:
+    """rcrepro-<name>-rocketchat-1 -> rocketchat (or rocketchat-1 if keep_index)."""
+    s = full
+    prefix = f"{config.PROJECT_PREFIX}{repro_name}-"
+    if s.startswith(prefix):
+        s = s[len(prefix):]
+    return s if keep_index else re.sub(r"-\d+$", "", s)
+
+
+def _short_res_map(resources: dict, repro_name: str) -> dict:
+    """Short-name-keyed resource map, keeping the instance index when a base name
+    repeats (multi-instance rocketchat-1/-2/-3) so no row overwrites another."""
+    bases = [_short_container(k, repro_name) for k in resources]
+    dup = {b for b in bases if bases.count(b) > 1}
+    out = {}
+    for k, v in resources.items():
+        base = _short_container(k, repro_name)
+        out[_short_container(k, repro_name, keep_index=True) if base in dup else base] = v
+    return out
+
+
+def _print_resources(report: dict, repro_name: str) -> None:
+    if not report:
+        return
+    typer.echo("")
+    ui.note("Resource cost (idle -> peak):")
+    labelled = _short_res_map(report, repro_name)
+    for name in sorted(labelled):
+        r = labelled[name]
+        mem_delta = (r.peak_mem - r.idle_mem) / 1e6
+        typer.echo(
+            f"  {name:<14} "
+            f"CPU {r.idle_cpu:.0f}% -> {r.peak_cpu:.0f}%   "
+            f"RAM {r.peak_mem/1e6:.0f} MB (+{mem_delta:.0f})"
+        )
+
+
+def _print_seed_result(s: dict, total: float, resources, meta: runner.Metadata) -> None:
+    d = s.get("durations", {})
+    lat = s.get("latency", {})
+    ui.ok(f"✓ seeded in {fmt_ms(total * 1000)}")
+
+    def row(label: str, count_num: int, dur_s: float, display: str = "", extra: str = "") -> None:
+        rate = f"{count_num / dur_s:.1f}/s" if dur_s > 0.05 and count_num else ""
+        typer.echo(f"  {label:<9} {(display or str(count_num)):>5}   {dur_s:4.1f}s   {rate:<8} {extra}")
+
+    lat_str = ""
+    if lat.get("count"):
+        lat_str = (f"p50 {fmt_ms(lat['p50'])} · p95 {fmt_ms(lat['p95'])} · "
+                   f"p99 {fmt_ms(lat['p99'])}  {s.get('latency_hist', '')}")
+    row("users", s["users"], d.get("users", 0.0))
+    row("channels", s["channels"], d.get("channels", 0.0))
+    row("messages", s["messages"], d.get("messages", 0.0), display=f"~{s['messages']}", extra=lat_str)
+    row("DMs", s["dms"], d.get("dms", 0.0))
+    _print_resources(resources or {}, meta.name)
 
 
 def _post_up(meta: runner.Metadata, wait: bool) -> None:
     if wait:
         _do_ready(meta)
     else:
-        ui.ok(f"✓ {meta.name!r} starting.")
-        typer.echo(f"  {meta.root_url}  (admin / {config.ADMIN_PASSWORD})")
-        typer.echo(f"  wait until ready: rc-repro ready --name {meta.name}")
-        typer.echo(f"  follow logs:      rc-repro logs --name {meta.name} -f")
-        _print_workspace(meta)   # the wait path prints it via _do_ready
+        ui.ok("✓ starting")
+        _summary_panel(meta)
+        ui.hint(f"  ready when serving : rc-repro ready --name {meta.name}")
+        ui.hint(f"  follow logs        : rc-repro logs --name {meta.name} -f")
+    _print_notes(meta)
 
+
+def _print_notes(meta: runner.Metadata) -> None:
     notes = meta.extra.get("notes")
-    if notes:
-        typer.echo("")
-        for line in notes:
-            ui.note(line)
-
-
-def _print_workspace(meta: runner.Metadata) -> None:
-    """For a multi-instance repro, print the load-balanced workspace URL plus the
-    direct URL of each instance (host_port+i). No-op for single-instance repros."""
-    n = meta.extra.get("instances")
-    if not n:
+    if not notes:
         return
+    inner = min(shutil.get_terminal_size((90, 24)).columns, 88) - 4
+    lines: list[str] = []
+    for n in notes:
+        n = _ascii(n)
+        lead = len(n) - len(n.lstrip())               # keep a note's own indent
+        lines += textwrap.wrap(n, width=inner, subsequent_indent=" " * (lead + 2)) or [""]
     typer.echo("")
-    ui.note(f"Multi-instance ({n} instances, load-balanced by Traefik):")
-    typer.echo(f"  Workspace URL (open this) : {meta.root_url}")
-    for i in range(1, int(n) + 1):
-        typer.echo(f"    rocketchat-{i} (direct)   : http://localhost:{meta.host_port + i}")
+    ui.box("notes", lines, inner, title_color=typer.colors.CYAN)
 
 
 @app.command()
@@ -416,7 +611,8 @@ def _wait_serving(meta: runner.Metadata, timeout: float) -> dict:
     typer.echo(f"Waiting for {meta.name!r} to serve {meta.root_url} ...")
 
     def is_alive() -> bool:
-        return runner.rc_state(meta.name) in ("running", "restarting")
+        # "created"/"restarting" are still coming up — only a real exit means dead.
+        return runner.rc_state(meta.name) in ("running", "restarting", "created")
 
     def tick(elapsed: float) -> None:
         typer.echo(f"  ... still booting ({int(elapsed)}s)")
@@ -478,6 +674,9 @@ def _pr_keycloak_master_ssl_off(meta: runner.Metadata, auth: rcapi.Auth, action:
     )
     if runner.compose_exec(meta.name, svc, ["bash", "-lc", script]) == 0:
         typer.echo("  ✓ Keycloak admin console enabled over HTTP.")
+    else:
+        ui.warn("  ⚠ could not relax Keycloak master-realm sslRequired "
+                "(is Keycloak up yet?) — the admin console may reject HTTP")
 
 
 def _pr_create_oauth_provider(meta: runner.Metadata, auth: rcapi.Auth, action: dict) -> None:
@@ -491,32 +690,82 @@ def _pr_create_oauth_provider(meta: runner.Metadata, auth: rcapi.Auth, action: d
         ui.warn("  ⚠ could not create the OAuth provider")
 
 
+def _pr_livechat_setup(meta: runner.Metadata, auth: rcapi.Auth, action: dict) -> None:
+    """Full Omnichannel setup: make admin (+ agent1..N) available agents, create a
+    department and assign them all to it. Canned responses / business hours are
+    Enterprise-only — attempted best-effort, noted if the license isn't present."""
+    url, pw = meta.root_url, config.ADMIN_PASSWORD
+    # 1. Agents: admin always, plus agent1..N.
+    agents = [{"agentId": auth.user_id, "username": config.ADMIN_USERNAME}]
+    rcapi.add_livechat_agent(url, auth, pw, config.ADMIN_USERNAME)
+    for i in range(2, int(action.get("agents", 1)) + 1):
+        u = f"agent{i}"
+        rcapi.create_user(url, auth, pw, u)
+        rcapi.add_livechat_agent(url, auth, pw, u)
+        uid = rcapi.get_user_id(url, auth, u)
+        if uid:
+            agents.append({"agentId": uid, "username": u})
+    available = rcapi.set_livechat_available(url, auth, pw)
+
+    # 2. Department + assign every agent to it.
+    dept, dept_ok = action.get("department"), False
+    if dept:
+        dept_id = rcapi.ensure_livechat_department(url, auth, pw, dept)
+        if dept_id:
+            dept_ok = rcapi.assign_livechat_agents(url, auth, pw, dept_id, agents)
+
+    # 3. Canned response (Enterprise — best effort).
+    canned = rcapi.save_canned_response(url, auth, pw, "hello",
+                                        "Hi! Thanks for reaching out — how can I help?")
+
+    if available:
+        summary = f"  ✓ Omnichannel: {len(agents)} agent(s) available"
+        if dept_ok:
+            summary += f", '{dept}' department created + assigned"
+        typer.echo(summary + " — log into RC to go online.")
+    else:
+        ui.warn("  ⚠ set up the Omnichannel agent manually (Admin → Omnichannel → Agents)")
+    if not canned:
+        ui.note("  (canned responses & business hours are Enterprise features — pass "
+                "--reg-token to enable, else set them up manually)")
+
+
 _POST_READY_ACTIONS = {
     "saml_idp_cert": _pr_saml_idp_cert,
     "keycloak_master_ssl_off": _pr_keycloak_master_ssl_off,
     "create_oauth_provider": _pr_create_oauth_provider,
+    "livechat_setup": _pr_livechat_setup,
 }
 
 
 def _run_post_ready(meta: runner.Metadata, auth) -> None:
+    actions = meta.extra.get("post_ready", [])
     if auth is None:
+        # Login failed (custom-admin preset, un-satisfiable 2FA, …). Don't let
+        # the preset's self-config vanish silently behind a "ready" banner.
+        if actions:
+            ui.warn(f"  ⚠ preset self-config skipped — could not log in as admin; "
+                    f"re-run once reachable: rc-repro ready --name {meta.name}")
         return
-    for action in meta.extra.get("post_ready", []):
+    for action in actions:
         handler = _POST_READY_ACTIONS.get(action.get("action"))
         if handler:
             handler(meta, auth, action)
 
 
 def _do_ready(meta: runner.Metadata, timeout: float = 300.0) -> None:
+    started = time.monotonic()
     info = _wait_serving(meta, timeout)
+    elapsed = int(time.monotonic() - started)   # time to actually serve /api/info
     auth = _finalize(meta)
     _run_post_ready(meta, auth)
 
-    running = info.get("version", "?")
-    ui.ok(f"✓ ready — Rocket.Chat {running} at {meta.root_url}")
-    _print_workspace(meta)
+    ui.ok("✓ ready")
+    _summary_panel(meta, extra_rows=[("Booted in", _fmt_duration(elapsed))])
+    ui.hint(f"  next: rc-repro logs --name {meta.name} -f")
     # The public /api/info redacts the patch (returns only major.minor), so
     # treat the running version as a prefix of the requested one.
+    running = info.get("version", "?")
     if running != "?" and not meta.rc_version.startswith(running):
         ui.warn(f"  note: running version {running} != requested {meta.rc_version}")
 
@@ -532,10 +781,17 @@ def _clear_default_if(name: str) -> None:
 def down(
     name: str = typer.Option("", "--name", "-n"),
     volumes: bool = typer.Option(False, "--volumes", help="also delete the data volume and forget the repro"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="skip the confirmation prompt (for scripts/CI)"),
 ) -> None:
     """Remove a repro's containers. Keeps data (and the record) unless --volumes."""
     _require_docker()
     target = _resolve_name(name)
+    if volumes and not yes:
+        # --volumes is irreversible (deletes the Mongo data + the record). Confirm.
+        typer.confirm(
+            f"This permanently deletes {target!r}'s data volume and record. Continue?",
+            abort=True,
+        )
     if runner.down(target, volumes=volumes) != 0:
         _err(f"`docker compose down` failed for {target!r} (see output above)")
     if volumes:
@@ -549,28 +805,112 @@ def down(
         typer.echo("  delete for good: add --volumes, or run `rc-repro prune`")
 
 
+def _detect_bind(doc: dict) -> str:
+    """Read the host bind interface from an existing published port (host:hp:cp)."""
+    for svc in doc.get("services", {}).values():
+        for p in svc.get("ports", []):
+            parts = str(p).split(":")
+            if len(parts) == 3:
+                return parts[0]
+    return config.DEFAULT_BIND_HOST
+
+
+def _rc_services_in(doc: dict) -> list[str]:
+    return [s for s in doc.get("services", {}) if s == "rocketchat" or s.startswith("rocketchat-")]
+
+
 @app.command()
-def prune() -> None:
-    """Delete all down repros (kept volumes + records). Skips pinned and running ones."""
+def monitor(
+    name: str = typer.Option("", "--name", "-n"),
+    off: bool = typer.Option(False, "--off", help="detach: remove Prometheus + Grafana"),
+) -> None:
+    """Attach (or --off to detach) Prometheus + Grafana on a running repro."""
+    _require_docker()
+    from rc_repro import monitoring
+    m = runner.read_meta(_resolve_name(name))
+    doc = runner.read_compose(m.name)
+
+    if off:
+        rcapi_ok = False
+        try:
+            auth = _login(m)
+            rcapi_ok = rcapi.set_setting(m.root_url, auth, config.ADMIN_PASSWORD,
+                                         monitoring.RC_METRICS_SETTING, False)
+        except Exception:  # noqa: BLE001 - best-effort; the repro may be stopped
+            pass
+        runner.rm_services(m.name, list(monitoring.SERVICES))
+        for s in monitoring.SERVICES:
+            doc.get("services", {}).pop(s, None)
+        for v in monitoring.VOLUMES:
+            doc.get("volumes", {}).pop(v, None)
+        m.extra.pop("monitoring", None)
+        m.extra.pop("monitoring_ports", None)
+        m.extra["notes"] = [n for n in m.extra.get("notes", []) if n not in monitoring.notes()]
+        runner.write(m.name, compose.to_yaml(doc), m)
+        ui.ok(f"✓ monitoring detached from {m.name!r}"
+              + ("" if rcapi_ok else " (metrics setting left as-is — repro not reachable)"))
+        return
+
+    # Attach.
+    _check_monitor_ports(exclude=m.name)
+    # Enable RC metrics live via the API (persists in Mongo; no RC restart).
+    try:
+        auth = _login(m)
+        if not rcapi.set_setting(m.root_url, auth, config.ADMIN_PASSWORD, monitoring.RC_METRICS_SETTING, True):
+            ui.warn("  ⚠ could not enable RC metrics via the API (is it ready?)")
+    except Exception as exc:  # noqa: BLE001
+        _err(f"repro not reachable to enable metrics (`rc-repro ready --name {m.name}` first): {exc}")
+
+    mon = monitoring.bind_ports(monitoring.services(), _detect_bind(doc))
+    doc.setdefault("services", {}).update(mon)
+    doc.setdefault("volumes", {}).update(monitoring.volumes())
+
+    m.extra["monitoring"] = True
+    m.extra["monitoring_ports"] = list(config.MONITOR_PORTS)
+    notes = [n for n in m.extra.get("notes", []) if n not in monitoring.notes()] + monitoring.notes()
+    m.extra["notes"] = notes
+    targets = _rc_services_in(doc) or ["rocketchat"]
+    runner.write(m.name, compose.to_yaml(doc), m, files=monitoring.files(targets))
+
+    if runner.up(m.name, pull=True) != 0:   # starts prometheus+grafana; RC unchanged -> not recreated
+        _err("`docker compose up` failed bringing up monitoring (see output above)")
+    ui.ok(f"✓ monitoring attached to {m.name!r}")
+    typer.echo("")
+    for line in monitoring.notes():
+        ui.note(line)
+
+
+@app.command()
+def prune(
+    yes: bool = typer.Option(False, "--yes", "-y", help="skip the confirmation prompt (for scripts/CI)"),
+) -> None:
+    """Delete every `down` repro — INCLUDING its data volume and record. Skips pinned and running ones."""
     _require_docker()
     states = runner.project_states()
     if states is None:
         # Can't tell "no containers" from "docker didn't answer" — deleting
         # volumes on that ambiguity would be destructive. Refuse.
         _err("couldn't query docker compose projects — not pruning (is Docker healthy?)")
+    # Only sweep repros whose containers are already gone (a plain `down`).
+    # Running or `stop`-paused repros still appear in project_states.
+    targets = [m.name for m in runner.list_meta()
+               if not m.pinned and m.project not in states]
+    if not targets:
+        typer.echo("Nothing to prune.")
+        return
+    if not yes:
+        typer.echo("These down repros will be deleted — containers, data volumes, and records:")
+        for t in targets:
+            typer.echo(f"  - {t}")
+        typer.confirm("Continue?", abort=True)
     removed = []
-    for m in runner.list_meta():
-        if m.pinned:
+    for name in targets:
+        if runner.down(name, volumes=True) != 0:
+            ui.warn(f"⚠ could not clean up {name!r} — skipping")
             continue
-        # Only sweep repros whose containers are already gone (a plain `down`).
-        # Running or `stop`-paused repros still appear in project_states.
-        if m.project not in states:
-            if runner.down(m.name, volumes=True) != 0:
-                ui.warn(f"⚠ could not clean up {m.name!r} — skipping")
-                continue
-            runner.remove(m.name)
-            _clear_default_if(m.name)
-            removed.append(m.name)
+        runner.remove(name)
+        _clear_default_if(name)
+        removed.append(name)
     if removed:
         ui.ok(f"✓ pruned {len(removed)}: {', '.join(removed)}")
     else:
@@ -645,22 +985,13 @@ def info(name: str = typer.Option("", "--name", "-n")) -> None:
     """Show a repro's URL, admin credentials and a curl snippet."""
     target = _resolve_name(name)
     m = runner.read_meta(target)
-    typer.echo(f"Repro   : {m.name}  (RC {m.rc_version}, mongo {m.mongo_tag}/{m.mongo_flavor})")
-    typer.echo(f"URL     : {m.root_url}")
-    typer.echo(f"Image   : {runner.image_ref(m)}")
-    typer.echo(f"Bind    : {m.bind_host}")
-    typer.echo(f"Admin   : {config.ADMIN_USERNAME} / {config.ADMIN_PASSWORD}")
-    typer.echo(f"Preset  : {m.preset}")
-    _print_workspace(m)
-    typer.echo("")
-    typer.echo("Example API call:")
-    typer.echo(f"  rc-repro api --name {m.name} GET /api/v1/me")
-    typer.echo(f"  curl {m.root_url}/api/info")
-    notes = m.extra.get("notes")
-    if notes:
-        typer.echo("")
-        for line in notes:
-            ui.note(line)
+    _summary_panel(m, extra_rows=[
+        ("Image", runner.image_ref(m)),
+        ("Bind", m.bind_host),
+    ])
+    ui.hint(f"  api  : rc-repro api --name {m.name} GET /api/v1/me")
+    ui.hint(f"  curl : {m.root_url}/api/info")
+    _print_notes(m)
 
 
 @app.command()
@@ -730,15 +1061,21 @@ def api(
         _err(f"--data is not valid JSON: {exc}")
 
     extra = rcapi.password_2fa_headers(config.ADMIN_PASSWORD) if two_fa else None
+    _t = time.monotonic()
     try:
         status, text = rcapi.call(m.root_url, method, path, auth=auth, data=body, extra_headers=extra)
     except requests.RequestException as exc:
         _err(f"request failed: {exc}")
+    elapsed = fmt_ms((time.monotonic() - _t) * 1000)
     tag = "PAT" if pat else "admin"
     if two_fa:
         tag += "+2fa"
-    typer.secho(f"HTTP {status}  [{tag}]", fg=typer.colors.GREEN if status < 400 else typer.colors.RED)
+    typer.secho(f"HTTP {status}  [{tag}]  in {elapsed}", fg=typer.colors.GREEN if status < 400 else typer.colors.RED)
     typer.echo(text)
+    # Exit non-zero on an HTTP error so `rc-repro api ... || handle` (the
+    # customer-script / CI use case) can detect it, not just transport failures.
+    if status >= 400:
+        raise typer.Exit(1)
 
 
 @app.command()
@@ -766,11 +1103,1020 @@ def seed_cmd(
     users: Optional[int] = typer.Option(None, "--users", help="override user count"),
     channels: Optional[int] = typer.Option(None, "--channels", help="override channel count"),
     messages: Optional[int] = typer.Option(None, "--messages", help="override messages per channel"),
+    stats: bool = typer.Option(False, "--stats", help="also report CPU/RAM cost of the seed"),
+    scale: str = typer.Option(
+        None, "--scale",
+        help="bulk Mongo prefill for scale repros, e.g. users=50000,messages=800000@team-chat"),
+    clear_scale: bool = typer.Option(
+        False, "--clear-scale", help="remove data a prior --scale added, then exit"),
 ) -> None:
-    """Populate a repro with sample users, channels, DMs and messages."""
+    """Populate a repro with sample users, channels, DMs and messages.
+
+    --scale bulk-inserts users/messages straight into MongoDB (orders of
+    magnitude faster than the REST seed) to reproduce SCALE/perf behaviour.
+    Bulk users are credential-less and messages fire no app hooks; use the
+    default REST seed when you need real, loginable users.
+    """
     _require_docker()
     m = runner.read_meta(_resolve_name(name))
-    _run_seed(m, profile, users, channels, messages)
+    if clear_scale:
+        _clear_scale(m)
+        return
+    if scale:
+        _run_scale(m, scale)
+        return
+    _run_seed(m, profile, users, channels, messages, stats=stats)
+
+
+@app.command(name="config-import")
+def config_import(
+    settings_file: str = typer.Argument(
+        ..., help="path to a support-dump *-settings.json"),
+    name: str = typer.Option("", "--name", "-n"),
+    only: str = typer.Option(
+        None, "--only", help="comma-separated id prefixes, e.g. Livechat,LDAP,Accounts"),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="show the import plan without changing anything"),
+) -> None:
+    """Apply a customer's exported settings (from a support dump) to a repro.
+
+    Imports only settings the customer CHANGED from default, skipping secrets the
+    dump redacts and identity/environment settings (license, Site_Url, assets)
+    that would break or pollute a local repro.
+    """
+    _require_docker()
+    path = Path(settings_file)
+    if not path.is_file():
+        _err(f"no such file: {settings_file}")
+    try:
+        plan = configimport.build_plan(
+            path, only={p.strip() for p in only.split(",")} if only else None)
+    except (ValueError, json.JSONDecodeError) as exc:
+        _err(f"couldn't read settings file: {exc}")
+    m = runner.read_meta(_resolve_name(name))
+
+    lines = [f"apply    {len(plan.apply)} customized setting(s)",
+             f"skip     {len(plan.redacted)} redacted secret(s), "
+             f"{len(plan.denied)} identity/environment setting(s)"]
+    if plan.oauth_services:
+        lines.append(f"oauth    pre-create: {', '.join(plan.oauth_services)}")
+    typer.echo("")
+    ui.box("config import" + (" (dry run)" if dry_run else ""), lines, 64,
+           title_color=typer.colors.CYAN)
+    if plan.redacted:
+        ui.warn("  set these by hand (redacted in the dump): "
+                + ", ".join(plan.redacted))
+    if dry_run:
+        for sid, value in plan.apply:
+            v = repr(value)
+            typer.echo(f"    {sid:<48} = {v[:60] + '…' if len(v) > 60 else v}")
+        return
+
+    try:
+        auth = _login(m)
+    except Exception as exc:  # noqa: BLE001
+        _err(f"can't import — repro not ready (`rc-repro ready --name {m.name}`): {exc}")
+    res = configimport.apply(m.root_url, auth, plan, log=lambda s: typer.echo(s))
+    if res["failed"]:
+        ui.warn(f"  {res['failed']} setting(s) rejected: {', '.join(res['failures'][:10])}"
+                + (" …" if res["failed"] > 10 else ""))
+    ui.ok(f"✓ imported {res['applied']} setting(s), skipped {res['skipped']}")
+    ui.hint("  some settings need an RC restart to fully take effect: "
+            f"rc-repro restart --name {m.name}")
+
+
+@app.command()
+def stats(
+    name: str = typer.Option("", "--name", "-n"),
+    for_: float = typer.Option(5.0, "--for", help="seconds to sample"),
+    watch: bool = typer.Option(False, "--watch", "-w", help="stream live (Ctrl-C to stop)"),
+) -> None:
+    """Sample a repro's container CPU/RAM (peak over a window, or --watch live)."""
+    _require_docker()
+    m = runner.read_meta(_resolve_name(name))
+    if watch:
+        typer.echo(f"Live stats for {m.name!r} (Ctrl-C to stop)…")
+        try:
+            while True:
+                ids = runner.container_ids(m.name)
+                out = runner.docker_stats(ids)
+                typer.echo("")
+                for line in out.splitlines():
+                    parts = line.split("\t")
+                    if len(parts) >= 3:
+                        typer.echo(f"  {_short_container(parts[0], m.name):<14} CPU {parts[1]:>7}   RAM {parts[2]}")
+                time.sleep(2)
+        except KeyboardInterrupt:
+            return
+    typer.echo(f"Sampling {m.name!r} for {for_:.0f}s…")
+    with perf.ResourceMonitor(m.name) as mon:
+        time.sleep(for_)
+    _print_resources(mon.report(), m.name)
+
+
+def _bench_metrics(resolved, boot_s: float, seed_total_s: float, s: dict, res: dict, name: str) -> dict:
+    lat, d = s.get("latency", {}), s.get("durations", {})
+    # Resources keyed by short container name (e.g. "rocketchat", "mongodb").
+    resources = {
+        _short_container(full, name): {
+            "idle_cpu": st.idle_cpu, "peak_cpu": st.peak_cpu,
+            "idle_mem": st.idle_mem, "peak_mem": st.peak_mem, "limit_mem": st.limit_mem,
+        }
+        for full, st in res.items()
+    }
+
+    def peak(short: str, key: str) -> float:
+        return resources.get(short, {}).get(key, 0.0)
+
+    msg_dur, user_dur = d.get("messages", 0.0), d.get("users", 0.0)
+    return {
+        "mongo": f"{resolved.mongo_tag} ({resolved.mongo_flavor})",
+        "image": f"{resolved.rc_image}:{resolved.rc_version}",
+        "boot_s": boot_s, "seed_total_s": seed_total_s,
+        "users": s["users"], "user_rate": s["users"] / user_dur if user_dur > 0.05 else 0.0,
+        "messages": s["messages"], "msg_rate": s["messages"] / msg_dur if msg_dur > 0.05 else 0.0,
+        "msg_p95_ms": lat.get("p95", 0.0), "msg_p99_ms": lat.get("p99", 0.0),
+        "rc_cpu": peak("rocketchat", "peak_cpu"), "mongo_cpu": peak("mongodb", "peak_cpu"),
+        "rc_mem_mb": peak("rocketchat", "peak_mem") / 1e6,
+        "seed": s, "resources": resources,   # full detail for the report
+    }
+
+
+def _bench_one(version: str, profile: str, offline: bool, no_pull: bool) -> dict:
+    """Boot one version, run the seed workload under resource monitoring, tear it
+    down, and return a metrics dict (ok=False + error on any failure)."""
+    result = {"version": version, "ok": False, "error": ""}
+    try:
+        resolved = versions.resolve(version, offline=offline)
+    except ValueError as exc:
+        result["error"] = str(exc)
+        return result
+
+    name = "bench-" + _sanitize(version)
+    if runner.exists(name):
+        # Only reclaim a workspace WE created (marked benchmark=True). Refuse to
+        # touch a real repro that happens to share the name — deleting it with
+        # its volume would be destructive.
+        existing = runner.read_meta(name)
+        if not (isinstance(existing.extra, dict) and existing.extra.get("benchmark")):
+            result["error"] = (f"a non-benchmark repro named {name!r} already exists — "
+                               f"rename or remove it before benchmarking {version}")
+            return result
+        runner.down(name, volumes=True)
+        runner.remove(name)
+    mon = None
+    try:
+        pre = presets.load("default")
+        host_port = runner.pick_port()
+        spec = compose.Spec.from_resolved(
+            resolved, project_name=runner.project_name(name),
+            root_url=f"http://localhost:{host_port}", host_port=host_port,
+            reg_token=None, preset=pre,
+        )
+        meta = runner.Metadata(
+            name=name, project=spec.project_name, rc_version=resolved.rc_version,
+            rc_image=resolved.rc_image, mongo_tag=resolved.mongo_tag,
+            mongo_flavor=resolved.mongo_flavor, preset="default",
+            root_url=spec.root_url, host_port=host_port, version_source=resolved.source,
+            extra={"benchmark": True},   # marks this workspace as ours to reclaim/clean up
+        )
+        runner.write(name, compose.to_yaml(compose.build(spec)), meta)
+        typer.secho(f"[{version}] booting on {meta.root_url} …", bold=True)
+        if runner.up(name, pull=not no_pull) != 0:
+            result["error"] = "docker compose up failed"
+            return result
+        t0 = time.monotonic()
+        rcapi.wait_ready(meta.root_url, timeout=300.0,
+                         is_alive=lambda: runner.rc_state(name) in ("running", "restarting", "created"))
+        boot_s = time.monotonic() - t0
+        auth = _finalize(meta) or rcapi.login(meta.root_url)
+        plan = seeder.plan_from(profile)
+        typer.echo(f"[{version}] seeding ({profile})…")
+        mon = perf.ResourceMonitor(name).start()
+        ts = time.monotonic()
+        s = seeder.seed(meta.root_url, auth, plan, log=lambda m: None)
+        seed_total = time.monotonic() - ts
+        res = mon.stop()
+        mon = None
+        result.update(_bench_metrics(resolved, boot_s, seed_total, s, res, name))
+        result["ok"] = True
+    except Exception as exc:  # noqa: BLE001 - record and move to the next version
+        result["error"] = str(exc)
+    finally:
+        if mon:
+            mon.stop()   # sampler thread must not outlive a failed version into the next
+        try:
+            runner.down(name, volumes=True)
+            runner.remove(name)
+        except Exception:  # noqa: BLE001 - a cleanup hiccup must not lose the other versions' results
+            pass
+    return result
+
+
+@app.command()
+def benchmark(
+    versions_: str = typer.Option(..., "--versions", help="comma-separated versions to compare, e.g. 8.4.1,8.5.1"),
+    seed_profile: str = typer.Option("standard", "--seed-profile", help="workload size: small | standard | large"),
+    regress_pct: float = typer.Option(25.0, "--regress-pct", help="flag a version if seed time or p95 rises more than this % vs the previous"),
+    offline: bool = typer.Option(False, "--offline"),
+    no_pull: bool = typer.Option(False, "--no-pull"),
+    report: bool = typer.Option(False, "--report", help=f"write a detailed markdown report to {config.reports_dir()}"),
+    report_path: str = typer.Option("", "--report-path", help="write the report to this file/dir instead (implies --report)"),
+) -> None:
+    """Boot several RC versions, run the identical seed workload against each, and
+    compare — a version performance-regression check unique to rc-repro."""
+    _require_docker()
+    vers = [v.strip() for v in versions_.split(",") if v.strip()]
+    if len(vers) < 2:
+        _err("give at least two --versions to compare, e.g. --versions 8.4.1,8.5.1")
+
+    typer.echo(f"Benchmarking {len(vers)} versions (workload: seed {seed_profile}, sequential)…\n")
+    results = [_bench_one(v, seed_profile, offline, no_pull) for v in vers]
+
+    typer.echo("")
+    headers, rows, flags = perf_report.table_rows(results, regress_pct)
+    typer.secho(headers[0], bold=True)
+    for row, flag in zip(rows, flags):
+        suffix = typer.style(f"   <- {flag}", fg=typer.colors.YELLOW) if flag else ""
+        typer.echo(row + suffix)
+    typer.echo("")
+    ui.note("Deltas between versions are the signal; absolute numbers are host-specific.")
+    if report or report_path:
+        host = {
+            "os": platform.platform(), "cpu": os.cpu_count() or "?",
+            "docker": runner.docker_server_version() or "?",
+            "compose": runner.compose_version() or "?",
+        }
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+        path = perf_report.write_benchmark(
+            results, seed_profile, regress_pct, stamp, host, dest=report_path or None
+        )
+        ui.ok(f"✓ wrote {path}")
+
+
+_HTTP_METHODS = {"GET", "POST", "PUT", "DELETE", "PATCH"}
+
+
+def _parse_endpoint(endpoint: str) -> tuple[str, str]:
+    """'GET /api/v1/x' -> ('GET', '/api/v1/x'); a bare '/api/v1/x' defaults to GET.
+    Raises ValueError on an empty/non-absolute path or an unsupported method."""
+    e = endpoint.strip()
+    if not e:
+        raise ValueError("empty endpoint")
+    parts = e.split(None, 1)
+    if len(parts) == 2 and parts[0].isalpha():
+        # First token looks like a method — it must be a supported one.
+        if parts[0].upper() not in _HTTP_METHODS:
+            raise ValueError(f"unsupported method {parts[0]!r} (use {', '.join(sorted(_HTTP_METHODS))})")
+        method, path = parts[0].upper(), parts[1].strip()
+    else:
+        method, path = "GET", e
+    if not path.startswith("/"):
+        raise ValueError(f"path must start with '/': {path!r}")
+    return method, path
+
+
+def _parse_ramp(ramp: str) -> tuple[int, int]:
+    """'10:200' -> (10, 200). Raises ValueError on a malformed spec."""
+    parts = ramp.split(":")
+    if len(parts) != 2:
+        raise ValueError("ramp must be START:END, e.g. 10:200")
+    try:
+        start, end = int(parts[0]), int(parts[1])
+    except ValueError:
+        raise ValueError("ramp START and END must be integers, e.g. 10:200")
+    if start < 0 or end < 1:
+        raise ValueError("ramp needs START >= 0 and END >= 1, e.g. 10:200")
+    return start, end
+
+
+def _loadtest_target(doc: dict) -> str:
+    """The in-network URL k6 should hit. Multi-instance repros front RC with
+    Traefik; single-instance ones expose `rocketchat` (or `rocketchat-1`)."""
+    svcs = doc.get("services", {})
+    if "traefik" in svcs:
+        return "http://traefik:80"
+    rc = _rc_services_in(doc)
+    if "rocketchat" in rc:
+        return "http://rocketchat:3000"
+    if rc:
+        return f"http://{rc[0]}:3000"
+    return "http://rocketchat:3000"
+
+
+def _status_breakdown(summary: dict) -> str:
+    """'2xx 1158 · 429 61 · 5xx 41' from the summary's status buckets (non-zero only)."""
+    st = summary.get("status") or {}
+    order = [("2xx", "2xx"), ("429", "429"), ("4xx", "4xx"), ("5xx", "5xx"), ("other", "other")]
+    parts = [f"{lbl} {int(st[k])}" for k, lbl in order if st.get(k)]
+    return " · ".join(parts)
+
+
+def _login_seed_users(m: runner.Metadata, count: int) -> list[dict]:
+    """Plain-login up to `count` seed users (alice, bob, …; password=username) and
+    return [{username, password, token, uid}] for those that succeed. Failures are
+    simply skipped (unseeded repro, or 2FA-guarded logins on the email preset)."""
+    users: list[dict] = []
+    url = m.root_url.rstrip("/") + "/api/v1/login"
+    for i in range(count):
+        uname = seeder.username(i)
+        try:
+            r = requests.post(url, json={"user": uname, "password": uname}, timeout=10)
+        except requests.RequestException:
+            break   # workspace unreachable — no point trying the rest
+        if r.status_code == 200:
+            d = r.json().get("data") or {}
+            if d.get("authToken"):
+                users.append({"username": uname, "password": uname,
+                              "token": d["authToken"], "uid": d["userId"]})
+    return users
+
+
+def _workspace_snapshot(m: runner.Metadata, auth: rcapi.Auth, instances: int) -> dict:
+    """Best-effort workspace context for the report/baseline: version, topology,
+    and dataset size — the numbers that make a perf result comparable."""
+    snap = {"rc_version": m.rc_version, "preset": m.preset, "instances": instances}
+    try:
+        # refresh=true: without it RC returns the last cron-generated stats,
+        # which are all zeros on a fresh workspace.
+        status, text = rcapi.call(m.root_url, "GET", "/api/v1/statistics?refresh=true", auth=auth)
+        if status == 200:
+            j = json.loads(text)
+            for key, field_ in (("users", "totalUsers"), ("rooms", "totalRooms"),
+                                ("messages", "totalMessages")):
+                if j.get(field_) is not None:
+                    snap[key] = j[field_]
+    except Exception:  # noqa: BLE001 - snapshot must never fail the run
+        pass
+    return snap
+
+
+def _print_steps(steps: dict) -> None:
+    if not steps:
+        return
+    from rc_repro.perf import baseline
+    typer.echo("")
+    ui.note("Per-step latency:")
+    typer.echo(f"  {'step':<8} {'count':>6}   {'p50':>7} {'p95':>7} {'p99':>7}")
+    for s in baseline.step_order(steps):
+        v = steps[s]
+        typer.echo(f"  {s:<8} {v.get('count', 0):>6.0f}   "
+                   f"{fmt_ms(v.get('p50') or 0):>7} {fmt_ms(v.get('p95') or 0):>7} "
+                   f"{fmt_ms(v.get('p99') or 0):>7}")
+
+
+def _fmt_compare_value(metric: str, v: float) -> str:
+    if "rps" in metric:
+        return f"{v:.1f}"
+    if "error" in metric:
+        return f"{v * 100:.2f}%"
+    return fmt_ms(v)
+
+
+def _print_compare(rows: list[dict], base: dict) -> None:
+    ctxb = base.get("ctx") or {}
+    typer.echo("")
+    ui.note(f"vs baseline {base.get('label', '?')!r} "
+            f"({ctxb.get('label', ctxb.get('scenario', '?'))}, saved {str(base.get('saved_at', ''))[:19]}):")
+    width = max((len(r["metric"]) for r in rows), default=0)
+    for r in rows:
+        before = _fmt_compare_value(r["metric"], r["before"])
+        after = _fmt_compare_value(r["metric"], r["after"])
+        line = f"  {r['metric']:<{width}}  {before:>8} -> {after:<8} {r['pct']:+6.0f}%"
+        if r["flag"]:
+            typer.secho(line + "   <- regression", fg=typer.colors.YELLOW)
+        elif not r["worse"] and abs(r["pct"]) > 25:
+            typer.secho(line, fg=typer.colors.GREEN)
+        else:
+            typer.echo(line)
+
+
+def _print_diag(rcm: dict, mongo_slow: dict | None, tl: dict | None,
+                verdict_lines: list[str], repro_name: str) -> None:
+    """Phase C console output: timeline, RC internals, slow queries, verdict."""
+    from rc_repro.perf import timeline as timeline_mod
+    if tl:
+        typer.echo("")
+        for line in timeline_mod.render_ascii(tl):
+            typer.echo(f"  {line}")
+    if rcm:
+        typer.echo("")
+        ui.note("RC internals during the test:")
+        for svc in sorted(rcm):
+            m = rcm[svc]
+            bits = []
+            # Histogram peak (per-interval) over the run; instantaneous as fallback.
+            peak = m.get("eventloop_lag_max_s") or m.get("eventloop_lag_s")
+            p99 = m.get("eventloop_lag_p99_s")
+            if peak:
+                lag_bit = f"event-loop lag peak {fmt_ms(peak['max'] * 1000)}"
+                if p99:
+                    lag_bit += f" / p99 {fmt_ms(p99['max'] * 1000)}"
+                bits.append(lag_bit)
+            heap = m.get("heap_used_bytes")
+            if heap:
+                bits.append(f"heap {heap['max'] / 1e6:.0f}MB")
+            ddp = m.get("ddp_users")
+            if ddp:
+                bits.append(f"ddp users {ddp['max']:.0f}")
+            if bits:
+                typer.echo(f"  {svc:<14} {'   '.join(bits)}")
+    if mongo_slow and mongo_slow.get("slow"):
+        typer.echo("")
+        ui.note(f"Slow MongoDB queries ({mongo_slow['total']} profiled, "
+                f"{mongo_slow['collscan']} COLLSCAN):")
+        for s in mongo_slow["slow"]:
+            plan = s.get("plan") or "?"
+            typer.echo(f"  {fmt_ms(s['millis']):>7}  {s['ns']}  {s['op']}  [{plan}]  "
+                       f"docs {s['docs']}/ret {s['ret']}")
+    if verdict_lines:
+        typer.echo("")
+        typer.secho("Verdict:", bold=True)
+        for line in verdict_lines:
+            wrapped = textwrap.wrap(_ascii(line), width=84, subsequent_indent="    ")
+            typer.secho("  - " + wrapped[0], fg=typer.colors.CYAN)
+            for cont in wrapped[1:]:
+                typer.secho("  " + cont, fg=typer.colors.CYAN)
+
+
+def _print_loadtest(ctx: dict, summary: dict, slo_results: list[dict]) -> None:
+    from rc_repro.perf import slo as slo_mod
+    rows = [
+        ("throughput", f"{summary.get('rps', 0):.1f} req/s   ({summary.get('count', 0):.0f} requests)"),
+        ("latency", f"p50 {summary.get('p50', 0):.0f}ms  p90 {summary.get('p90', 0):.0f}ms  "
+                    f"p95 {summary.get('p95', 0):.0f}ms  p99 {summary.get('p99', 0):.0f}ms"),
+        ("", f"avg {summary.get('avg', 0):.0f}ms  min {summary.get('min', 0):.0f}ms  "
+             f"max {summary.get('max', 0):.0f}ms"),
+        ("errors", f"{summary.get('error_rate', 0) * 100:.2f}%   checks {summary.get('checks_rate', 0) * 100:.0f}% ok"),
+    ]
+    breakdown = _status_breakdown(summary)
+    if breakdown:
+        rows.append(("responses", breakdown))
+    if ctx.get("constrained"):
+        rows.append(("constrained", ctx["constrained"]))
+    load = (f"ramp {ctx['ramp']}" if ctx.get("ramp") else f"{ctx['vus']} VUs") + f" / {ctx['duration']}"
+    if ctx.get("users"):
+        load += f", {ctx['users']} users"
+    ui.panel(f"loadtest {ctx.get('label', ctx['scenario'])} ({load})", rows)
+    _print_steps(summary.get("steps") or {})
+    if slo_results:
+        typer.echo("")
+        passed = all(r["ok"] for r in slo_results)
+        for r in slo_results:
+            sym, color = ("✓", typer.colors.GREEN) if r["ok"] else ("✗", typer.colors.RED)
+            detail = ("not measured" if not r.get("measured", True)
+                      else f"actual {slo_mod.fmt_actual(r['key'], r['actual'])}")
+            typer.secho(f"  {sym} {r['key']} {r['op']} {r['raw']}  ({detail})", fg=color)
+        typer.secho(f"\nSLO gate: {'PASS' if passed else 'FAIL'}",
+                    fg=typer.colors.GREEN if passed else typer.colors.RED, bold=True)
+
+
+@app.command()
+def loadtest(
+    name: str = typer.Option("", "--name", "-n"),
+    scenario: str = typer.Option("messages", "--scenario", help="messages | login | read | mixed | journey | webhook | badbot | custom"),
+    endpoint: str = typer.Option("", "--endpoint", help="custom scenario: the call to hit, e.g. \"GET /api/v1/channels.list?count=100\""),
+    body: str = typer.Option("", "--body", help="custom scenario: JSON request body for POST/PUT/PATCH"),
+    vus: int = typer.Option(10, "--vus", help="virtual users (k6 concurrent workers — not RC accounts)"),
+    users_n: int = typer.Option(10, "--users", help="spread load across up to N seeded users (alice, bob, …); 0 = admin token only"),
+    duration: str = typer.Option("30s", "--duration", help="test duration, e.g. 60s, 2m"),
+    ramp: str = typer.Option("", "--ramp", help="ramp VUs start:end over --duration, e.g. 10:200"),
+    spike: str = typer.Option("", "--spike", help="spike test base:peak over --duration (base 1/3, peak 1/3, recovery 1/3), e.g. 10:100 — reports recovery time"),
+    live: bool = typer.Option(False, "--live", help="stream k6 metrics into the attached monitoring stack's Prometheus (watch live in Grafana)"),
+    slo: str = typer.Option("", "--slo", help="pass/fail gate, e.g. p95=300ms,error=1%,rps=100"),
+    constrain: str = typer.Option("", "--constrain", help="cap services to customer-sized hardware for the test, e.g. \"rc=2cpu/2g,mongo=1cpu/1g\" (live docker update; restored after)"),
+    diag: bool = typer.Option(True, "--diag/--no-diag", help="server-side diagnosis: RC event-loop lag, Mongo slow queries, latency-over-time, verdict"),
+    slowms: int = typer.Option(100, "--slowms", help="Mongo profiler threshold in ms (queries slower than this are captured)"),
+    stats: bool = typer.Option(False, "--stats", help="also report container CPU/RAM during the test"),
+    save: str = typer.Option("", "--save", help="save this run as a named baseline (~/.rc-repro/loadtests/)"),
+    compare: str = typer.Option("", "--compare", help="compare this run against a saved baseline"),
+    json_out: bool = typer.Option(False, "--json", help="print the result as JSON (for CI/scripts); suppresses pretty output"),
+    report: bool = typer.Option(False, "--report", help=f"write a markdown report to {config.reports_dir()}"),
+    report_path: str = typer.Option("", "--report-path", help="write the report to this file/dir instead (implies --report)"),
+) -> None:
+    """Drive real HTTP load at a repro with k6 and check it against an SLO.
+
+    Load is spread across seeded users when available (--users, default 10) so
+    it carries real per-user identity; the journey scenario times each step of a
+    realistic session. --save/--compare give before/after deltas across runs.
+    k6 runs on the repro's docker network (works with loopback-only binds); the
+    REST rate limiter is disabled for the run and restored after. Exits non-zero
+    if a --slo rule is not met — usable as a CI gate.
+    """
+    _require_docker()
+    from rc_repro import monitoring
+    from rc_repro.perf import (baseline, constrain as constrain_mod, k6, mongoprof,
+                               rcmetrics, slo as slo_mod, timeline as timeline_mod,
+                               verdict as verdict_mod)
+    if scenario not in k6.SCENARIOS:
+        _err(f"unknown scenario {scenario!r} (choose: {', '.join(k6.SCENARIOS)})")
+    # Custom scenario: parse "METHOD /path" and pass it to the k6 script via env.
+    extra_env, method, path = None, "", ""
+    if scenario == "custom":
+        if not endpoint:
+            _err("--scenario custom needs --endpoint, e.g. --endpoint \"GET /api/v1/channels.list\"")
+        try:
+            method, path = _parse_endpoint(endpoint)
+        except ValueError as exc:
+            _err(f"bad --endpoint: {exc}")
+        if body and method in ("GET", "DELETE"):
+            _err(f"--body is not sent with a {method} request")
+        extra_env = {"RC_METHOD": method, "RC_PATH": path, "RC_BODY": body or None}
+    elif endpoint or body:
+        _err("--endpoint/--body only apply to --scenario custom")
+    if vus < 1:
+        _err("--vus must be >= 1")
+    if users_n < 0:
+        _err("--users must be >= 0")
+
+    # In --json mode informational warnings are collected into the JSON payload
+    # instead of printed, so stdout stays a single parseable object.
+    warnings: list[str] = []
+
+    def _warn(msg: str) -> None:
+        if json_out:
+            warnings.append(msg.strip().lstrip("⚠ "))
+        else:
+            ui.warn(msg)
+
+    if ramp and spike:
+        _err("--ramp and --spike are mutually exclusive load shapes")
+    if ramp:
+        try:
+            _parse_ramp(ramp)
+        except ValueError as exc:
+            _err(f"bad --ramp: {exc}")
+        if vus != 10:   # 10 is the --vus default; a non-default value is ignored under --ramp
+            _warn("  note: --vus is ignored when --ramp is given")
+    if spike:
+        try:
+            s_base, s_peak = _parse_ramp(spike)   # same START:END grammar
+        except ValueError as exc:
+            _err(f"bad --spike: {exc}")
+        if s_peak <= s_base:
+            _err(f"--spike peak must exceed base ({spike!r})")
+        if vus != 10:
+            _warn("  note: --vus is ignored when --spike is given")
+    for lbl in (save, compare):
+        if lbl:
+            try:
+                baseline.sanitize_label(lbl)
+            except ValueError as exc:
+                _err(str(exc))
+    constraints = {}
+    if constrain:
+        try:
+            constraints = constrain_mod.parse(constrain)
+        except ValueError as exc:
+            _err(f"bad --constrain: {exc}")
+    rules = []
+    if slo:
+        try:
+            rules = slo_mod.parse(slo)
+        except ValueError as exc:
+            _err(f"bad --slo: {exc}")
+
+    m = runner.read_meta(_resolve_name(name))
+    doc = runner.read_compose(m.name)
+    target = _loadtest_target(doc)
+    if live:
+        if not (isinstance(m.extra, dict) and m.extra.get("monitoring")):
+            _err(f"--live needs the monitoring stack — attach it first: rc-repro monitor --name {m.name}")
+        # Monitoring attached before this version has a Prometheus without the
+        # remote-write receiver, so k6's push would be silently rejected.
+        prom_cmd = (doc.get("services", {}).get("prometheus") or {}).get("command", [])
+        if not any("remote-write-receiver" in str(c) for c in prom_cmd):
+            _err("--live needs Prometheus with remote-write enabled, but this repro's "
+                 "monitoring predates it. Re-attach it: "
+                 f"rc-repro monitor --name {m.name} --off && rc-repro monitor --name {m.name}")
+    per_service = {}
+    if constraints:
+        try:
+            per_service = constrain_mod.resolve_services(constraints, list(doc.get("services", {})))
+        except ValueError as exc:
+            _err(f"bad --constrain: {exc}")
+    # Load the baseline up front: a typo'd label must fail before the run, not after.
+    base = None
+    if compare:
+        try:
+            base = baseline.load(compare)
+        except (FileNotFoundError, ValueError) as exc:
+            _err(str(exc))
+
+    # Auth as a bypass-2FA PAT — exactly how a customer's script would hit the API.
+    try:
+        auth = _login(m)
+        token = rcapi.generate_pat(m.root_url, auth, config.ADMIN_PASSWORD,
+                                   token_name="rc-repro-loadtest", bypass_2fa=True)
+    except Exception as exc:  # noqa: BLE001
+        _err(f"could not authenticate (ready? `rc-repro ready --name {m.name}`): {exc}")
+
+    # Real per-user identity: log in as seeded users and hand them to k6 so VUs
+    # round-robin across them. The custom scenario stays on the admin PAT —
+    # customer scripts are usually admin calls, and admin-only endpoints must
+    # keep working. No seeded logins -> fall back to the admin token (v1).
+    users: list[dict] = []
+    if users_n > 0 and scenario != "custom":
+        users = _login_seed_users(m, users_n)
+        if not users:
+            _warn("  ⚠ no seeded users could log in — using the admin token "
+                  "(run `rc-repro seed` first for realistic multi-user load)")
+    # The webhook scenario posts through a real incoming-webhook integration —
+    # create (or reuse) it now and hand its tokenized path to k6.
+    if scenario == "webhook":
+        hook_path = rcapi.create_incoming_webhook(m.root_url, auth, config.ADMIN_PASSWORD)
+        if not hook_path:
+            _err("could not create the incoming webhook integration (check admin permissions)")
+        extra_env = {**(extra_env or {}), "RC_HOOK_PATH": hook_path}
+    snapshot = _workspace_snapshot(m, auth, instances=max(1, len(_rc_services_in(doc))))
+
+    label = f"custom {method} {path}" if scenario == "custom" else scenario
+    load = (f"spike {spike}" if spike else f"ramp {ramp}" if ramp else f"{vus} VUs") + f" for {duration}"
+    identity = f"{len(users)} seeded users" if users else "admin token"
+    rc_services = _rc_services_in(doc) or ["rocketchat"]
+    # The timeline (k6 point stream) powers latency-over-time AND spike recovery,
+    # so collect it whenever diag is on OR a spike is requested.
+    want_timeline = diag or bool(spike)
+
+    # Everything below mutates workspace state (resource caps, rate limiter, the
+    # Prometheus setting, Mongo profiling) — all of it lives inside this try so a
+    # failure OR a Ctrl-C anywhere in setup or the run still hits the finally and
+    # restores. Restore-tracked vars are initialised first so the finally is
+    # always valid even if we abort before setting them.
+    applied_constraints: list = []
+    limiter_was_off = True
+    metrics_changed, mongo_prior, sampler, mon = False, None, None, None
+    resources = None
+    summary = None
+    rcm_report: dict = {}
+    since_ms = int(time.time() * 1000)
+    try:
+        # Customer-sized hardware: cap the services first, so a failed apply
+        # can't leave later settings changed. apply() self-rolls-back mid-way.
+        if per_service:
+            try:
+                applied_constraints = constrain_mod.apply(m.name, per_service)
+            except RuntimeError as exc:
+                _err(f"could not apply --constrain: {exc}")
+            snapshot["constraints"] = constrain_mod.human(per_service)
+            if not json_out:
+                ui.note(f"  constrained: {snapshot['constraints']} (restored after the test)")
+
+        # Disable the API rate limiter so the offered load isn't throttled into a
+        # false result. Restored below — back ON unless it was already known-off
+        # (an unreadable setting -> None -> restores to ON, never left disabled).
+        limiter_was_off = rcapi.get_setting(m.root_url, auth, config.ADMIN_PASSWORD,
+                                            config.RC_RATE_LIMITER_SETTING) is False
+        if not limiter_was_off and not rcapi.set_setting(
+            m.root_url, auth, config.ADMIN_PASSWORD, config.RC_RATE_LIMITER_SETTING, False
+        ):
+            _warn("  ⚠ could not disable the API rate limiter — results may be throttled (429s)")
+
+        if not json_out:
+            typer.secho(f"Load test: {label} @ {load} as {identity} -> {target} "
+                        f"(via k6 on {m.name!r}'s network)\n", bold=True)
+            if live:
+                grafana = f"http://localhost:{config.MONITOR_PORTS[1]}"
+                ui.note(f"  live: k6 metrics streaming into Prometheus — open the "
+                        f"'k6 Load Test' dashboard in Grafana ({grafana}), "
+                        "or Explore -> k6_*")
+
+        # Server-side diagnosis (Phase C): RC's own /metrics (event-loop lag) and
+        # Mongo's query profiler, armed for the run. Both best-effort.
+        if diag:
+            if rcapi.get_setting(m.root_url, auth, config.ADMIN_PASSWORD,
+                                 monitoring.RC_METRICS_SETTING) is not True:
+                metrics_changed = rcapi.set_setting(m.root_url, auth, config.ADMIN_PASSWORD,
+                                                    monitoring.RC_METRICS_SETTING, True)
+            mongo_prior = mongoprof.start(m.name, slowms)
+            if mongo_prior is None:
+                _warn("  ⚠ Mongo slow-query capture unavailable (profiler could not be enabled)")
+
+        mon = perf.ResourceMonitor(m.name).start() if stats else None
+        since_ms = int(time.time() * 1000)
+        if diag:
+            sampler = rcmetrics.RCMetricsSampler(m.name, rc_services).start()
+        summary = k6.run(m.name, scenario, vus=vus, duration=duration, ramp=ramp or None,
+                         token=token, uid=auth.user_id, target=target, extra_env=extra_env,
+                         users=users or None, quiet=json_out, timeline=want_timeline,
+                         spike=spike or None, live=live)
+    except RuntimeError as exc:
+        _err(str(exc))   # raises typer.Exit; finally still runs (mon stopped, limiter restored)
+    finally:
+        if sampler:
+            rcm_report = sampler.stop()
+        if mon:
+            resources = mon.stop()
+        if not limiter_was_off:
+            try:
+                rcapi.set_setting(m.root_url, auth, config.ADMIN_PASSWORD,
+                                  config.RC_RATE_LIMITER_SETTING, True)
+            except Exception:  # noqa: BLE001 - best-effort restore
+                _warn("  ⚠ could not restore the API rate limiter setting")
+        if metrics_changed:
+            try:
+                rcapi.set_setting(m.root_url, auth, config.ADMIN_PASSWORD,
+                                  monitoring.RC_METRICS_SETTING, False)
+            except Exception:  # noqa: BLE001
+                _warn("  ⚠ could not restore the Prometheus metrics setting")
+        if mongo_prior:
+            mongoprof.stop(m.name, mongo_prior)
+        for problem in constrain_mod.restore(applied_constraints):
+            _warn(f"  ⚠ could not restore resource limits — {problem}")
+        # users.json holds seeded-user tokens — don't leave them on disk.
+        (runner.workspace(m.name) / "loadtest" / "users.json").unlink(missing_ok=True)
+
+    # Collect the diagnosis artifacts (profile entries survive the level reset).
+    mongo_slow = mongoprof.collect(m.name, since_ms) if (diag and mongo_prior) else None
+    tl = None
+    if want_timeline:
+        points = runner.workspace(m.name) / "loadtest" / "points.json"
+        tl = timeline_mod.parse(points)
+        points.unlink(missing_ok=True)   # can be tens of MB — don't leave it around
+
+    ctx = {"name": m.name, "version": m.rc_version, "scenario": scenario, "vus": vus,
+           "duration": duration, "ramp": ramp, "target": target, "label": label,
+           "users": len(users), "constrained": snapshot.get("constraints", "")}
+    slo_results = slo_mod.evaluate(rules, summary) if rules else []
+    compare_rows = baseline.compare({"summary": summary}, base) if base else []
+    if base and (base.get("ctx") or {}).get("scenario") not in (None, scenario):
+        _warn(f"  ⚠ baseline {compare!r} was a {(base['ctx']or{}).get('scenario')!r} run — "
+              f"comparing across scenarios")
+    if base and (base.get("snapshot") or {}).get("constraints") != snapshot.get("constraints"):
+        _warn(f"  ⚠ baseline {compare!r} ran under different resource constraints "
+              f"({(base.get('snapshot') or {}).get('constraints') or 'none'} vs "
+              f"{snapshot.get('constraints') or 'none'}) — deltas reflect the hardware change")
+
+    short_res = _short_res_map(resources, m.name) if resources else None
+    spike_rec = timeline_mod.spike_recovery(tl) if (spike and tl) else None
+    # RAM slope over the run (only meaningful on long runs) — the soak signal.
+    soak = _short_res_map(mon.mem_slopes(), m.name) if mon else None
+    verdict_lines = (verdict_mod.analyze(summary, rcmetrics=rcm_report or None,
+                                         mongo=mongo_slow, resources=short_res, timeline=tl,
+                                         soak=soak or None, spike=spike_rec)
+                     if diag else [])
+    diag_payload = {"rcmetrics": rcm_report, "mongo": mongo_slow, "timeline": tl,
+                    "spike": spike_rec, "verdict": verdict_lines} if diag else None
+
+    if not json_out:
+        typer.echo("")
+        _print_loadtest(ctx, summary, slo_results)
+        if spike_rec:
+            rec = spike_rec["recovered_after_s"]
+            msg = (f"  spike: baseline p95 {fmt_ms(spike_rec['baseline_p95'])} -> peak "
+                   f"{fmt_ms(spike_rec['spike_p95'])} -> "
+                   + (f"recovered ~{rec}s after load dropped" if rec is not None
+                      else "NOT recovered within the run"))
+            (ui.ok if rec is not None and rec <= 30 else ui.warn)(msg)
+        if diag:
+            _print_diag(rcm_report, mongo_slow, tl, verdict_lines, m.name)
+        if compare_rows:
+            _print_compare(compare_rows, base)
+        _print_resources(resources or {}, m.name)
+
+    saved_to = report_file = ""
+    if save:
+        saved_to = baseline.save(save, {
+            "label": baseline.sanitize_label(save),
+            "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "ctx": ctx, "summary": summary, "snapshot": snapshot,
+        })
+        if not json_out:
+            typer.echo("")
+            ui.ok(f"✓ saved baseline {baseline.sanitize_label(save)!r} "
+                  f"(compare later with --compare {baseline.sanitize_label(save)})")
+
+    if report or report_path:
+        host = {"os": platform.platform(), "cpu": os.cpu_count() or "?",
+                "docker": runner.docker_server_version() or "?",
+                "compose": runner.compose_version() or "?"}
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+        report_file = perf_report.write_loadtest(
+            ctx, summary, slo_results, short_res, host, stamp,
+            dest=report_path or None, snapshot=snapshot,
+            compare={"label": base.get("label"), "saved_at": base.get("saved_at"),
+                     "rows": compare_rows} if base else None,
+            diag=diag_payload,
+        )
+        if not json_out:
+            typer.echo("")
+            ui.ok(f"✓ wrote {report_file}")
+
+    passed = (not slo_results) or all(r["ok"] for r in slo_results)
+    if json_out:
+        result = {"ctx": ctx, "summary": summary, "slo": slo_results, "passed": passed,
+                  "snapshot": snapshot, "warnings": warnings}
+        if diag_payload:
+            result["diag"] = diag_payload
+        if resources:
+            result["resources"] = {k: dc_asdict(v) for k, v in (short_res or {}).items()}
+        if base:
+            result["compare"] = {"baseline": base.get("label"), "rows": compare_rows}
+        if saved_to:
+            result["saved_baseline"] = saved_to
+        if report_file:
+            result["report"] = report_file
+        typer.echo(json.dumps(result, indent=2))
+
+    if not passed:
+        raise typer.Exit(1)
+
+
+@app.command()
+def capacity(
+    name: str = typer.Option("", "--name", "-n"),
+    scenario: str = typer.Option("journey", "--scenario", help="which workload to scale: journey | messages | read | mixed | login | badbot"),
+    users_n: int = typer.Option(10, "--users", help="spread load across up to N seeded users; 0 = admin only"),
+    slo: str = typer.Option("p95=500ms,error=2%", "--slo", help="the limit that defines 'capacity'"),
+    start: int = typer.Option(10, "--start", help="first VU step"),
+    max_vus: int = typer.Option(640, "--max", help="stop doubling past this many VUs"),
+    step_duration: str = typer.Option("20s", "--step-duration", help="how long each step runs"),
+    constrain: str = typer.Option("", "--constrain", help="find capacity on customer-sized hardware, e.g. \"rc=2cpu/2g\" (restored after)"),
+    report: bool = typer.Option(False, "--report", help=f"write a markdown report to {config.reports_dir()}"),
+    report_path: str = typer.Option("", "--report-path", help="write the report to this file/dir instead (implies --report)"),
+    json_out: bool = typer.Option(False, "--json", help="print the result as JSON"),
+) -> None:
+    """Find how much concurrency a repro sustains before the SLO breaks.
+
+    Doubles VUs (start, 2x, 4x, …) running the scenario at each step until a
+    rule fails, then bisects between the last pass and first fail — ending with
+    "handles ~N concurrent VUs" plus why it broke (event-loop lag at the wall).
+    """
+    _require_docker()
+    from rc_repro import monitoring
+    from rc_repro.perf import constrain as constrain_mod, k6, rcmetrics, slo as slo_mod
+    if scenario not in k6.SCENARIOS or scenario in ("custom", "webhook"):
+        _err("capacity supports the built-in scenarios (journey/messages/read/mixed/login/badbot)")
+    try:
+        rules = slo_mod.parse(slo)
+    except ValueError as exc:
+        _err(f"bad --slo: {exc}")
+    if start < 1 or max_vus < start:
+        _err("--start must be >= 1 and --max >= --start")
+    constraints = {}
+    if constrain:
+        try:
+            constraints = constrain_mod.parse(constrain)
+        except ValueError as exc:
+            _err(f"bad --constrain: {exc}")
+
+    m = runner.read_meta(_resolve_name(name))
+    doc = runner.read_compose(m.name)
+    target = _loadtest_target(doc)
+    rc_services = _rc_services_in(doc) or ["rocketchat"]
+    per_service = {}
+    if constraints:
+        try:
+            per_service = constrain_mod.resolve_services(constraints, list(doc.get("services", {})))
+        except ValueError as exc:
+            _err(f"bad --constrain: {exc}")
+
+    try:
+        auth = _login(m)
+        token = rcapi.generate_pat(m.root_url, auth, config.ADMIN_PASSWORD,
+                                   token_name="rc-repro-loadtest", bypass_2fa=True)
+    except Exception as exc:  # noqa: BLE001
+        _err(f"could not authenticate (ready? `rc-repro ready --name {m.name}`): {exc}")
+    users = _login_seed_users(m, users_n) if users_n > 0 else []
+
+    # As in loadtest: every mutation (resource caps, rate limiter, the Prometheus
+    # setting) lives inside the try so a failure or Ctrl-C in setup or mid-search
+    # still restores. Restore-tracked vars are initialised first.
+    applied_constraints: list = []
+    limiter_was_off = True
+    metrics_changed = False
+    steps: list[dict] = []
+    last_pass = first_fail = None
+
+    def run_step(n: int, tag: str = "") -> dict:
+        sampler = rcmetrics.RCMetricsSampler(m.name, rc_services).start()
+        try:
+            s = k6.run(m.name, scenario, vus=n, duration=step_duration, ramp=None,
+                       token=token, uid=auth.user_id, target=target,
+                       users=users or None, quiet=True)
+        finally:
+            rcm = sampler.stop()
+        res = slo_mod.evaluate(rules, s)
+        lag_max = 0.0
+        for svc_m in rcm.values():
+            lag = svc_m.get("eventloop_lag_max_s") or svc_m.get("eventloop_lag_s")
+            if lag:
+                lag_max = max(lag_max, lag["max"])
+        row = {"vus": n, "rps": s.get("rps", 0.0), "p95": s.get("p95", 0.0),
+               "error_rate": s.get("error_rate", 0.0), "ok": all(r["ok"] for r in res),
+               "lag_max_s": lag_max,
+               "breached": [f"{r['key']} {r['op']} {r['raw']} "
+                            f"(actual {slo_mod.fmt_actual(r['key'], r['actual'])})"
+                            for r in res if not r["ok"]]}
+        steps.append(row)
+        if not json_out:
+            mark = typer.style("PASS", fg=typer.colors.GREEN) if row["ok"] else \
+                typer.style(f"FAIL ({'; '.join(row['breached'])})", fg=typer.colors.RED)
+            typer.echo(f"  {n:>4} VUs{tag:<9}  {row['rps']:>7.1f} req/s   "
+                       f"p95 {fmt_ms(row['p95']):>7}   err {row['error_rate'] * 100:>5.2f}%   {mark}")
+        return row
+
+    try:
+        if per_service:
+            try:
+                applied_constraints = constrain_mod.apply(m.name, per_service)
+            except RuntimeError as exc:
+                _err(f"could not apply --constrain: {exc}")
+        limiter_was_off = rcapi.get_setting(m.root_url, auth, config.ADMIN_PASSWORD,
+                                            config.RC_RATE_LIMITER_SETTING) is False
+        if not limiter_was_off:
+            rcapi.set_setting(m.root_url, auth, config.ADMIN_PASSWORD,
+                              config.RC_RATE_LIMITER_SETTING, False)
+        if rcapi.get_setting(m.root_url, auth, config.ADMIN_PASSWORD,
+                             monitoring.RC_METRICS_SETTING) is not True:
+            metrics_changed = rcapi.set_setting(m.root_url, auth, config.ADMIN_PASSWORD,
+                                                monitoring.RC_METRICS_SETTING, True)
+        identity = f"{len(users)} seeded users" if users else "admin token"
+        if not json_out:
+            typer.secho(f"Capacity search: {scenario} as {identity}, SLO {slo} "
+                        f"(steps of {step_duration}"
+                        + (f", constrained {constrain_mod.human(per_service)}" if per_service else "")
+                        + ")\n", bold=True)
+        n = start
+        while n <= max_vus:
+            row = run_step(n)
+            if row["ok"]:
+                last_pass = n
+                n *= 2
+            else:
+                first_fail = n
+                break
+        if first_fail and last_pass:
+            lo, hi = last_pass, first_fail
+            for _ in range(2):   # two bisect rounds tighten the estimate enough
+                mid = (lo + hi) // 2
+                if mid <= lo or mid >= hi:
+                    break
+                row = run_step(mid, tag=" (bisect)")
+                if row["ok"]:
+                    lo = last_pass = mid
+                else:
+                    hi = first_fail = mid
+    finally:
+        if not limiter_was_off:
+            try:
+                rcapi.set_setting(m.root_url, auth, config.ADMIN_PASSWORD,
+                                  config.RC_RATE_LIMITER_SETTING, True)
+            except Exception:  # noqa: BLE001
+                ui.warn("  ⚠ could not restore the API rate limiter setting")
+        if metrics_changed:
+            try:
+                rcapi.set_setting(m.root_url, auth, config.ADMIN_PASSWORD,
+                                  monitoring.RC_METRICS_SETTING, False)
+            except Exception:  # noqa: BLE001
+                ui.warn("  ⚠ could not restore the Prometheus metrics setting")
+        for problem in constrain_mod.restore(applied_constraints):
+            ui.warn(f"  ⚠ could not restore resource limits — {problem}")
+        # users.json holds seeded-user tokens — don't leave them on disk.
+        (runner.workspace(m.name) / "loadtest" / "users.json").unlink(missing_ok=True)
+
+    if last_pass is None:
+        result = f"breaches the SLO even at {start} VUs — start lower (--start)"
+    elif first_fail is None:
+        result = f"holds the SLO up to {last_pass} VUs (never breached; raise --max to push further)"
+    else:
+        result = f"~{last_pass} concurrent VUs (holds at {last_pass}, breaks at {first_fail})"
+    why = ""
+    # Explain the breach at the refined boundary (post-bisect), not the first
+    # chronological fail — "breaks at 20" should be justified by the 20-VU step.
+    breach_row = next((r for r in steps if r["vus"] == first_fail), None) if first_fail \
+        else next((r for r in steps if not r["ok"]), None)
+    if breach_row:
+        if breach_row["lag_max_s"] >= 0.5:
+            why = (f"at {breach_row['vus']} VUs the RC event loop saturated "
+                   f"(lag peaked at {fmt_ms(breach_row['lag_max_s'] * 1000)})")
+        else:
+            why = f"at {breach_row['vus']} VUs: {'; '.join(breach_row['breached'])}"
+
+    if not json_out:
+        typer.echo("")
+        typer.secho(f"Capacity: {result}", bold=True,
+                    fg=typer.colors.GREEN if last_pass else typer.colors.RED)
+        if why:
+            ui.note(f"  why it broke: {why}")
+
+    ctx = {"name": m.name, "version": m.rc_version, "scenario": scenario,
+           "slo": slo, "users": len(users), "step_duration": step_duration,
+           "target": target, "constrained": constrain_mod.human(per_service) if per_service else ""}
+    if report or report_path:
+        host = {"os": platform.platform(), "cpu": os.cpu_count() or "?",
+                "docker": runner.docker_server_version() or "?",
+                "compose": runner.compose_version() or "?"}
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+        path_ = perf_report.write_capacity(ctx, steps, result, why, host, stamp,
+                                           dest=report_path or None)
+        if not json_out:
+            typer.echo("")
+            ui.ok(f"✓ wrote {path_}")
+    if json_out:
+        typer.echo(json.dumps({"ctx": ctx, "steps": steps, "capacity_vus": last_pass,
+                               "breach_vus": first_fail, "result": result, "why": why},
+                              indent=2))
 
 
 @app.command()
@@ -788,11 +2134,23 @@ def logs(
 @app.command(name="presets")
 def presets_cmd() -> None:
     """List available presets."""
-    for p in presets.list_presets():
-        ee = "  [needs license]" if p.requires_license else ""
-        typer.echo(f"{p.name:<14} {p.description.strip()}{ee}")
-        for key, help_text in p.params_help.items():
-            typer.echo(f"{'':<14}   --set {key}=…  {help_text}")
+    items = presets.list_presets()
+    inner = min(shutil.get_terminal_size((90, 24)).columns, 88) - 4   # box content width
+    typer.secho("Presets", bold=True)
+    typer.echo("")
+    for p in items:
+        lines = textwrap.wrap(_ascii(" ".join(p.description.split())), width=inner) or [""]
+        if p.params_help:
+            lines.append("")
+            key_w = max(len(k) for k in p.params_help)
+            for key, help_text in p.params_help.items():
+                entry = f"--set {key.ljust(key_w)}   {_ascii(' '.join(help_text.split()))}"
+                cont = " " * (len("--set ") + key_w + 3)   # hang-indent wrapped help
+                lines += textwrap.wrap(entry, width=inner, subsequent_indent=cont)
+        title = p.name + ("  [needs license]" if p.requires_license else "")
+        ui.box(title, lines, inner)
+        typer.echo("")
+    ui.hint("run: rc-repro up --version <X.Y.Z> --preset <name> [--set key=value]")
 
 
 @app.command(name="versions")

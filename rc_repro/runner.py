@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import socket
 import subprocess
@@ -20,6 +21,14 @@ from urllib.parse import urlsplit
 import yaml
 
 from rc_repro import config
+
+
+def _atomic_write(path: Path, content: str) -> None:
+    """Write via a temp file in the same dir + os.replace, so readers never see a
+    partially written file (rename is atomic on the same filesystem)."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(content, encoding="utf-8")
+    os.replace(tmp, path)
 
 
 @dataclass
@@ -57,13 +66,19 @@ def write(name: str, compose_yaml: str, meta: Metadata,
           files: list[tuple[str, str]] | None = None) -> None:
     ws = workspace(name)
     ws.mkdir(parents=True, exist_ok=True)
-    (ws / "docker-compose.yml").write_text(compose_yaml, encoding="utf-8")
-    (ws / "repro.json").write_text(json.dumps(asdict(meta), indent=2), encoding="utf-8")
+    # Write atomically (temp + rename): an interruption mid-write must not leave a
+    # half-written repro.json that read_meta would choke on, nor a compose file
+    # out of sync with its metadata.
+    _atomic_write(ws / "docker-compose.yml", compose_yaml)
+    _atomic_write(ws / "repro.json", json.dumps(asdict(meta), indent=2))
     # Preset-generated files (e.g. a seeded LDIF that a service mounts).
+    # `{{ROOT_URL}}` is substituted with the repro's URL — presets are built
+    # before the host port is known, so a generated file that must reference the
+    # workspace URL (e.g. the livechat widget embed snippet) uses the placeholder.
     for relpath, content in files or []:
         fp = ws / relpath
         fp.parent.mkdir(parents=True, exist_ok=True)
-        fp.write_text(content, encoding="utf-8")
+        fp.write_text(content.replace("{{ROOT_URL}}", meta.root_url), encoding="utf-8")
 
 
 def read_meta(name: str) -> Metadata:
@@ -203,6 +218,13 @@ def evidence(name: str) -> dict:
     }
 
 
+def read_compose(name: str) -> dict:
+    """Load a repro's generated docker-compose.yml as a dict (for in-place edits
+    like attaching/detaching the monitoring stack)."""
+    import yaml
+    return yaml.safe_load((workspace(name) / "docker-compose.yml").read_text(encoding="utf-8")) or {}
+
+
 def list_meta() -> list[Metadata]:
     root = config.repros_dir()
     if not root.exists():
@@ -227,11 +249,13 @@ def used_ports() -> set[int]:
         n = m.extra.get("instances") if isinstance(m.extra, dict) else None
         if isinstance(n, int) and n > 1:
             ports.update(m.host_port + i for i in range(1, n + 1))
-        # Preset side services (Keycloak/Mailpit/MinIO…) publish fixed host
-        # ports, recorded at `up` — claimed too, so allocation avoids them.
-        side = m.extra.get("sidecar_ports") if isinstance(m.extra, dict) else None
-        if isinstance(side, list):
-            ports.update(int(p) for p in side if isinstance(p, int) or str(p).isdigit())
+        # Preset side services (Keycloak/Mailpit/MinIO…) and the monitoring
+        # add-on (Prometheus/Grafana) publish fixed host ports recorded at `up` —
+        # claimed too, so RC port allocation avoids them.
+        for key in ("sidecar_ports", "monitoring_ports"):
+            claimed = m.extra.get(key) if isinstance(m.extra, dict) else None
+            if isinstance(claimed, list):
+                ports.update(int(p) for p in claimed if isinstance(p, int) or str(p).isdigit())
     return ports
 
 
@@ -239,7 +263,18 @@ PORT_MAX = 65535
 
 
 def port_free(port: int) -> bool:
-    """True if `port` can be bound on the host right now (nothing listening)."""
+    """True if `port` is free to publish on the host right now."""
+    # First: is something already LISTENING on loopback? A wildcard bind with
+    # SO_REUSEADDR (below) can miss a docker publish on 127.0.0.1:<port> (repros
+    # bind loopback), so probe it directly — connect success == in use.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(0.2)
+        try:
+            if probe.connect_ex(("127.0.0.1", port)) == 0:
+                return False
+        except OSError:
+            return False
+    # Then: can we actually bind it? (catches reserved-but-not-listening ports.)
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         # On Unix, SO_REUSEADDR lets us probe a port that's only in TIME_WAIT.
         # On Windows it would let bind() succeed even for an active listener
@@ -347,6 +382,57 @@ def logs(name: str, *, follow: bool = False, tail: int | None = None) -> int:
 def compose_exec(name: str, service: str, args: list[str]) -> int:
     """Run a command inside a running compose service (docker compose exec -T)."""
     return _compose(name, "exec", "-T", service, *args).returncode
+
+
+def compose_exec_capture(name: str, service: str, args: list[str]) -> tuple[int, str]:
+    """Like compose_exec, but captures stdout: (returncode, stdout)."""
+    r = _compose(name, "exec", "-T", service, *args, capture=True)
+    return r.returncode, r.stdout or ""
+
+
+def rm_services(name: str, services: list[str]) -> int:
+    """Stop and remove specific services (docker compose rm -s -f <services>)."""
+    return _compose(name, "rm", "-s", "-f", *services).returncode
+
+
+def service_container_ids(name: str, service: str) -> list[str]:
+    """Container id(s) of one compose service in this repro (usually a single id)."""
+    r = _compose(name, "ps", "-q", service, capture=True)
+    if r.returncode != 0:
+        return []
+    return [line.strip() for line in r.stdout.splitlines() if line.strip()]
+
+
+def docker_capacity() -> tuple[float, int] | None:
+    """(cpus, memory_bytes) available to the docker engine/VM, or None."""
+    r = subprocess.run(["docker", "info", "--format", "{{.NCPU}} {{.MemTotal}}"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    try:
+        ncpu, mem = r.stdout.split()
+        return float(ncpu), int(mem)
+    except ValueError:
+        return None
+
+
+def container_ids(name: str) -> list[str]:
+    """Container ids of a repro's running services (docker compose ps -q)."""
+    proc = _compose(name, "ps", "-q", capture=True)
+    return [line for line in (proc.stdout or "").split() if line]
+
+
+def docker_stats(container_ids: list[str]) -> str:
+    """One `docker stats --no-stream` sample for the given containers, as
+    tab-separated `name<TAB>cpu%<TAB>mem-usage` lines ('' on error/none)."""
+    if not container_ids:
+        return ""
+    proc = subprocess.run(
+        ["docker", "stats", "--no-stream", "--format",
+         "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}", *container_ids],
+        capture_output=True, text=True,
+    )
+    return proc.stdout if proc.returncode == 0 else ""
 
 
 def ps(name: str) -> str:
