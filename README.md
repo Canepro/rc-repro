@@ -11,10 +11,14 @@ rc-repro up --version 8.5.1 --name TICKET-1234 --wait   # boot it
 rc-repro down --name TICKET-1234 --volumes              # bin it when done
 ```
 
+Prefer a UI? `rc-repro serve` opens a local web dashboard for everything below
+(create, seed, config-import, load-test, monitoring). See [Web GUI](#web-gui-rc-repro-serve).
+
 ## Contents
 
 - [Getting started](#getting-started) — prerequisites, install, your first repro
 - [Everyday use](#everyday-use) — commands & lifecycle
+- [Web GUI](#web-gui-rc-repro-serve) — `rc-repro serve`, a local dashboard
 - [Scenarios](#scenarios) — presets (LDAP, SAML, email, …) & monitoring
 - [Data & performance](#data--performance) — sample data, data-scale prefill, config import, benchmarking, load testing
 - [API testing](#api-testing)
@@ -33,6 +37,18 @@ rc-repro down --name TICKET-1234 --volumes              # bin it when done
 > **Apple Silicon note:** only the Bitnami MongoDB image (used for MongoDB < 8,
 > i.e. RC < 8) is amd64-only and runs under emulation, so those boots are slower.
 > Everything else (Rocket.Chat, official MongoDB 8+, OpenLDAP, Keycloak) is native.
+
+> **Podman / non-Docker engines:** rc-repro talks to any Docker-compatible API, so
+> Podman works via the `docker.sock` helper (`podman-mac-helper`). Two known traps:
+> - **Kernel ≥ 6.19 can't run MongoDB 8.0** ([SERVER-121912](https://jira.mongodb.org/browse/SERVER-121912)),
+>   which recent RC versions require — common on fresh Podman machines / Fedora
+>   CoreOS. `rc-repro doctor` warns when it detects this; use an engine on kernel
+>   < 6.19 until MongoDB ships a fix.
+> - **Docker Hub anonymous pull-rate limits** (`registry.rocket.chat` counts against
+>   Hub too) — run `docker login` (Hub username + a Personal Access Token).
+>
+> When a boot fails from either cause, `up` now names it directly instead of a bare
+> "`docker compose up` failed".
 
 ## Install
 
@@ -57,6 +73,17 @@ connectivity and ports. Fix any ✗ before continuing:
 ```bash
 rc-repro doctor
 ```
+
+> **Web GUI (optional):** the `rc-repro serve` dashboard needs a couple of extra
+> deps (the `gui` extra). With pipx use the PEP 508 `name[extra] @ URL` form:
+>
+> ```bash
+> pipx install 'rc-repro[gui] @ git+https://github.com/klovekesh37/rc-repro'
+> # already installed? add the extra by reinstalling:
+> pipx install --force 'rc-repro[gui] @ git+https://github.com/klovekesh37/rc-repro'
+> ```
+>
+> In a venv: `pip install -e '.[gui]'`. The core CLI stays dependency-light without it.
 
 <details>
 <summary><b>Updating to the latest version</b></summary>
@@ -134,6 +161,38 @@ rc-repro stop         # each evening — nothing lost
 
 Once a repro is pinned (or set with `rc-repro use <name>`), commands with no
 `--name` act on it: `rc-repro start`, `rc-repro logs -f`, etc.
+
+---
+
+# Web GUI (`rc-repro serve`)
+
+A local, browser-based dashboard over the same engine as the CLI — useful when
+you'd rather click than type. Needs the `gui` extra (see [Install](#install)).
+
+```bash
+rc-repro serve            # prints a http://localhost:7070/?t=... URL and opens it
+rc-repro serve --port 8080 --no-open
+```
+
+It binds **loopback only** by default and prints a one-time session token in the
+URL (repros run weak fixed credentials, so the control plane must not be exposed
+to your network — `--bind 0.0.0.0` requires an explicit opt-in and warns).
+
+What you can do from it:
+
+- **Dashboard** — every repro as a card (version, port, state, uptime/health),
+  with filter / status / sort. Click a card for a **detail panel**: Overview
+  (RC/Mongo/port/uptime/health), **Logs / Containers / Env-vars** tabs, clickable
+  **links** to RC and preset sidecars (MinIO, Keycloak, Mailpit, Grafana), a live
+  **CPU/Mem chart**, and a copyable local URL.
+- **Create** a repro (with an Advanced section for `--reg-token`, `--mongo`,
+  `--rc-image`, `--bind`, pin/offline/no-pull), **seed** (profile / bulk `--scale`
+  / clear), **config-import** (upload a support-dump `*-settings.json` → preview
+  the plan → apply), attach/detach **monitoring**, and run the **perf** suite
+  (load test with an embedded k6 Grafana dashboard, capacity, benchmark).
+
+Long operations stream live progress in the browser. Everything the GUI does is
+also a CLI command — same code underneath.
 
 ---
 
@@ -307,6 +366,10 @@ rc-repro up --version 8.5.1 --preset multi-instance --set instances=3 --monitor
 - **Grafana**: `http://localhost:5050` (`admin`/`admin`, anonymous view enabled) —
   the official **"Rocket.Chat Metrics"** dashboard is auto-provisioned.
 - **Prometheus**: `http://localhost:9090` (Status → Targets shows RC up).
+- **Logs → Loki**: an OpenTelemetry collector tails **this repro's** containers and
+  ships their logs to Loki, queryable in Grafana (Explore → Loki, e.g.
+  `{k8s_namespace_name="rcrepro-<name>"}`). The collector is scoped to the repro's
+  compose project, so it never ingests your other repros.
 
 Attach or detach on an **already-running** repro (RC is not restarted — metrics are
 enabled live via the API):
@@ -602,10 +665,11 @@ rc-repro api --name test --2fa  POST /api/v1/settings/<id> -d '{"value":true}'
 | `loadtest` | drive concurrent HTTP load with k6 as real seeded users; per-step latency, SLO gate, `--save`/`--compare` baselines, `--spike`, `--live` |
 | `capacity` | double VUs until the SLO breaks, bisect the boundary — "handles ~N concurrent" + why it broke |
 | `monitor` | attach/detach Prometheus + Grafana on a running repro |
+| `serve` | launch the local [web GUI](#web-gui-rc-repro-serve) (needs `pip install 'rc-repro[gui]'`) |
 | `logs` | tail a repro's logs |
 | `presets` | list available presets |
 | `versions <X.Y.Z>` | show the resolved MongoDB pairing (without launching) |
-| `doctor` | preflight checks (Docker, Compose, disk, ports, connectivity) |
+| `doctor` | preflight checks (Docker, Compose, engine kernel, Hub auth, disk, ports, connectivity) |
 | `prune` | delete all `down` repros (confirms first, `--yes` to skip) |
 
 Run `rc-repro <command> --help` for flags.

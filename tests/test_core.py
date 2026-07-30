@@ -206,11 +206,11 @@ def test_livechat_preset_shape():
 
 def test_unknown_set_param_rejected():
     # `--set agent=5` (typo for `agents`) was silently ignored before.
-    from rc_repro import cli
+    from rc_repro.services import lifecycle as lc
     p = presets.load("livechat")
-    assert cli._unknown_params({"agent": "5"}, p) == ["agent"]      # typo caught
-    assert cli._unknown_params({"agents": "5"}, p) == []            # correct key accepted
-    assert cli._unknown_params({"x": "1"}, presets.load("default")) == ["x"]  # no-param preset
+    assert lc._unknown_params({"agent": "5"}, p) == ["agent"]      # typo caught
+    assert lc._unknown_params({"agents": "5"}, p) == []            # correct key accepted
+    assert lc._unknown_params({"x": "1"}, presets.load("default")) == ["x"]  # no-param preset
 
 
 def test_root_url_substitution(tmp_path, monkeypatch):
@@ -514,10 +514,10 @@ def test_yaml_preset_notes_parsed(tmp_path, monkeypatch):
 
 
 def test_sanitize_can_produce_empty_name():
-    # cli.up guards this: an all-symbols --name would otherwise write into the
-    # repros root itself.
-    from rc_repro.cli import _sanitize
-    assert _sanitize("!!!") == ""
+    # create_repro guards this: an all-symbols name would otherwise write into
+    # the repros root itself.
+    from rc_repro.services.lifecycle import sanitize
+    assert sanitize("!!!") == ""
 
 
 # --- config / runner (12-factor items) -----------------------------------------
@@ -879,6 +879,21 @@ def test_monitoring_ships_k6_loadtest_dashboard():
 def test_no_monitoring_by_default():
     doc = compose.build(_spec("8.4.1"))
     assert "prometheus" not in doc["services"] and "grafana" not in doc["services"]
+
+
+def test_monitoring_ships_logs_stack():
+    # Loki + OTel collector, mirroring RocketChat/rocketchat-compose; the
+    # collector must be SCOPED to this repro's project so it never tails others.
+    from rc_repro import monitoring
+    svcs = monitoring.services()
+    assert "loki" in svcs and "opentelemetry-logs-collector" in svcs
+    assert "loki_data" in monitoring.VOLUMES
+    fs = dict(monitoring.files(["rocketchat"], project="rcrepro-demo"))
+    assert "monitoring/loki/config.yaml" in fs
+    assert "monitoring/grafana/provisioning/datasources/loki.yml" in fs
+    otel = fs["monitoring/otel/config.yaml"]
+    assert "http://loki:3100/otlp" in otel              # exports to Loki
+    assert 'com.docker.compose.project"] == "rcrepro-demo"' in otel  # scoped to this repro
 
 
 def test_monitoring_bind_ports_handles_portless_exporters():
