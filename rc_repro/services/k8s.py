@@ -397,11 +397,18 @@ def create_repro(name: str, rc_version: str, *, offline: bool = False,
                  artifact_name="values.yaml")
     events.info(emit, f"forwarding localhost:{host_port}", phase="wait", pct=80)
 
+    # Report what the forward is actually doing, not what was intended. Started
+    # this early it often dies immediately, because the chart's Service has no
+    # ready endpoints yet and kubectl port-forward exits when it cannot bind to
+    # one. That is exactly why the forward is reconcilable state: `ready`, `info`,
+    # and anything else needing HTTP call ensure_port_forward first and revive it.
+    # Claiming "up" here would be the kind of confident-but-wrong status that
+    # sends someone debugging their network instead of waiting for a pod.
     return {"name": name, "namespace": plan.namespace, "context": ctx,
             "topology": "kubernetes", "rc_version": plan.rc_version,
             "mongo_tag": plan.mongo_tag, "chart": CHART,
             "root_url": meta.root_url, "host_port": host_port,
-            "port_forward": "up"}
+            "port_forward": forward_state(meta)}
 
 
 def teardown(name: str, *, volumes: bool = False, emit: Emit = null_emit,

@@ -386,7 +386,10 @@ def test_k8s_create_persists_shared_metadata(tmp_path, monkeypatch):
     assert not (ws / "docker-compose.yml").exists()
     assert "microservices" in (ws / "values.yaml").read_text()
     assert fake.forwards == [("rc-repro-t2", 31234)]
-    assert out["port_forward"] == "up"
+    # The reported state is probed, not assumed. Started right after helm install
+    # the forward often dies (the Service has no ready endpoints yet), so claiming
+    # "up" would send someone debugging their network instead of waiting for a pod.
+    assert out["port_forward"] == "down"     # fake pid is not alive
 
 
 def test_k8s_forward_state_reports_down_without_failing_the_repro(tmp_path, monkeypatch):
