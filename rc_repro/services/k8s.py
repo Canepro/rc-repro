@@ -96,12 +96,17 @@ class _Runner:
             start_new_session=True)
         return proc.pid
 
-    def install(self, ctx: str, ns: str, values: dict) -> subprocess.CompletedProcess:
+    def install(self, ctx: str, ns: str, values: dict,
+                chart_version: str = "") -> subprocess.CompletedProcess:
         """helm install with values on stdin, so no temp file is left behind."""
-        return subprocess.run(
-            ["helm", "install", "rc", CHART, "--kube-context", ctx,
-             "-n", ns, "--values", "-"],
-            input=yaml.safe_dump(values), capture_output=True, text=True, check=True)
+        argv = ["helm", "install", "rc", CHART, "--kube-context", ctx,
+                "-n", ns, "--values", "-"]
+        if chart_version:
+            # Pinned: an unpinned install silently changes behaviour the next time
+            # the chart is released, which defeats a version-matched repro.
+            argv += ["--version", chart_version]
+        return subprocess.run(argv, input=yaml.safe_dump(values),
+                              capture_output=True, text=True, check=True)
 
 
 @dataclass
@@ -247,6 +252,64 @@ def build_values(rc_version: str, *, offline: bool = False,
                 rc_image=rc_image or r.rc_image, mongo_tag=tag, values=values)
 
 
+def _version_key(v: str) -> tuple:
+    """Sort key for a semver-ish string. Non-numeric parts sort low."""
+    out = []
+    for part in str(v).split("."):
+        digits = re.match(r"(\d+)", part)
+        out.append(int(digits.group(1)) if digits else -1)
+    return tuple(out)
+
+
+def resolve_chart_version(rc_version: str, run: _Runner | None = None,
+                          emit: Emit = null_emit) -> str:
+    """Pick the chart version for a Rocket.Chat version, and never hard-fail.
+
+    Most Rocket.Chat releases have no chart with a matching appVersion, so an exact
+    match cannot be required. The rule is: exact appVersion match if one exists,
+    otherwise the newest chart whose appVersion is at or below the requested
+    version (a floor, so the chart is never newer than the app it deploys),
+    otherwise the newest chart with a warning.
+
+    Returning "" means "let helm choose", which is the unpinned behaviour this
+    function exists to avoid; it is only used when the index cannot be read at all.
+    """
+    run = run or _Runner()
+    res = run.run(["helm", "search", "repo", CHART, "--versions", "-o", "json"],
+                  check=False)
+    try:
+        entries = json.loads(res.stdout or "[]")
+    except ValueError:
+        entries = []
+    charts = [(e.get("version", ""), e.get("app_version", "")) for e in entries
+              if e.get("version")]
+    if not charts:
+        events.warn(emit, "could not read the chart index; helm will choose the "
+                          "chart version, so this run is not fully pinned",
+                    phase="resolve")
+        return ""
+
+    exact = [c for c, app in charts if app == rc_version]
+    if exact:
+        return max(exact, key=_version_key)
+
+    want = _version_key(rc_version)
+    floor = [(app, c) for c, app in charts if app and _version_key(app) <= want]
+    if floor:
+        # Newest *appVersion* at or below the request, and the newest chart among
+        # ties. Sorting by chart version alone could pick a chart that packages an
+        # older Rocket.Chat just because its own version number is higher.
+        chart = max(floor, key=lambda ac: (_version_key(ac[0]), _version_key(ac[1])))[1]
+        events.info(emit, f"no chart declares appVersion {rc_version}; using the "
+                          f"newest at or below it ({chart})", phase="resolve")
+        return chart
+
+    chart = max((c for c, _ in charts), key=_version_key)
+    events.warn(emit, f"no chart at or below appVersion {rc_version}; using the "
+                      f"newest chart {chart}, which may not match", phase="resolve")
+    return chart
+
+
 def cluster_exists(run: _Runner | None = None) -> bool:
     run = run or _Runner()
     res = run.run(["kind", "get", "clusters"], check=False)
@@ -356,6 +419,13 @@ def create_repro(name: str, rc_version: str, *, offline: bool = False,
     # Fail on the impossible combination now rather than after a long wait.
     check_mongo_kernel_support(plan.mongo_tag, run)
 
+    run.run(["helm", "repo", "add", HELM_REPO_NAME, HELM_REPO_URL], check=False)
+    run.run(["helm", "repo", "update", HELM_REPO_NAME], check=False)
+    plan.chart_version = resolve_chart_version(plan.rc_version, run, emit)
+    if plan.chart_version:
+        events.info(emit, f"chart {plan.chart_version} for Rocket.Chat "
+                          f"{plan.rc_version}", phase="resolve", pct=8)
+
     ctx = ensure_cluster(emit, run)
 
     events.info(emit, f"creating namespace {plan.namespace}", phase="provision", pct=20)
@@ -370,9 +440,7 @@ def create_repro(name: str, rc_version: str, *, offline: bool = False,
     init_replica_set(run, ctx, plan.namespace, emit)
 
     events.info(emit, "installing the Rocket.Chat chart", phase="boot", pct=55)
-    run.run(["helm", "repo", "add", HELM_REPO_NAME, HELM_REPO_URL], check=False)
-    run.run(["helm", "repo", "update", HELM_REPO_NAME], check=False)
-    run.install(ctx, plan.namespace, plan.values)
+    run.install(ctx, plan.namespace, plan.values, plan.chart_version)
 
     events.info(emit, "chart installed", phase="wait", pct=70)
 
@@ -407,6 +475,7 @@ def create_repro(name: str, rc_version: str, *, offline: bool = False,
     return {"name": name, "namespace": plan.namespace, "context": ctx,
             "topology": "kubernetes", "rc_version": plan.rc_version,
             "mongo_tag": plan.mongo_tag, "chart": CHART,
+            "chart_version": plan.chart_version,
             "root_url": meta.root_url, "host_port": host_port,
             "port_forward": forward_state(meta)}
 

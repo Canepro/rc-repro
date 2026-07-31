@@ -247,9 +247,18 @@ class _FakeRun:
 
     def __init__(self, *, tools=("kind", "kubectl", "helm"), clusters="",
                  kernel="6.8.0-generic", labels='{"app.kubernetes.io/managed-by":"rc-repro"}',
-                 mongo_ready="true", rs_ok="1"):
+                 mongo_ready="true", rs_ok="1", index=None):
         self.tools, self.clusters, self.kernel, self.labels = tools, clusters, kernel, labels
         self.mongo_ready, self.rs_ok = mongo_ready, rs_ok
+        # A realistic slice of `helm search repo --versions -o json`, including the
+        # sparse appVersion coverage the real index has.
+        self.index = index if index is not None else [
+            {"version": "7.0.2", "app_version": "8.6.1"},
+            {"version": "7.0.1", "app_version": "8.6.1"},
+            {"version": "7.0.0", "app_version": "8.5.0"},
+            {"version": "6.32.1", "app_version": "8.2.0"},
+            {"version": "6.27.1", "app_version": "7.11.0"},
+        ]
         self.calls: list[list[str]] = []
         self.applied: list[str] = []
         self.installed: list[dict] = []
@@ -274,13 +283,16 @@ class _FakeRun:
             out = self.rs_ok
         elif any("rs.initiate" in a for a in argv):
             out = "{ ok: 1 }"
+        elif argv[:3] == ["helm", "search", "repo"]:
+            import json as _j
+            out = _j.dumps(self.index)
         return subprocess.CompletedProcess(argv, 0, out, "")
 
     def apply(self, ctx, ns, manifest):
         self.applied.append(manifest)
 
-    def install(self, ctx, ns, values):
-        self.installed.append(values)
+    def install(self, ctx, ns, values, chart_version=""):
+        self.installed.append({"values": values, "chart_version": chart_version})
 
     def sleep(self, seconds):
         pass          # never actually wait in tests
@@ -338,7 +350,9 @@ def test_k8s_create_labels_for_ownership_and_installs_the_chart():
     # every kubectl call passes an explicit context: the ambient one is never used
     assert all("--context" in c for c in fake.calls if c[0] == "kubectl")
     assert fake.applied and "replSet" in fake.applied[0]   # replica set, not standalone
-    assert fake.installed and fake.installed[0]["mongodb"]["enabled"] is False
+    assert fake.installed and fake.installed[0]["values"]["mongodb"]["enabled"] is False
+    # the chart is pinned, not left to helm's "latest"
+    assert fake.installed[0]["chart_version"] == "7.0.2"
 
 
 def test_k8s_teardown_refuses_a_namespace_it_does_not_own():
@@ -465,3 +479,35 @@ def test_k8s_tolerates_an_already_initiated_replica_set():
             return super().run(argv, check=check)
 
     k8s.init_replica_set(AlreadyInit(), "ctx", "ns")   # no raise
+
+
+def test_k8s_chart_resolution_prefers_an_exact_appversion():
+    from rc_repro.services import k8s
+    # two charts declare 8.6.1; the newest wins
+    assert k8s.resolve_chart_version("8.6.1", _FakeRun()) == "7.0.2"
+
+
+def test_k8s_chart_resolution_floors_when_no_exact_match():
+    # Most Rocket.Chat releases have no chart declaring them, so an exact match
+    # cannot be required. Never pick a chart newer than the app it deploys.
+    from rc_repro.services import k8s
+    # chart 7.0.0 declares appVersion 8.5.0, which is newer than 8.4.0, so the
+    # floor is chart 6.32.1 (appVersion 8.2.0) rather than the highest chart number
+    assert k8s.resolve_chart_version("8.4.0", _FakeRun()) == "6.32.1"
+    assert k8s.resolve_chart_version("8.0.0", _FakeRun()) == "6.27.1"  # 8.2.0 too new
+    # and the chart is never newer than the app it deploys
+    assert k8s.resolve_chart_version("8.5.0", _FakeRun()) == "7.0.0"
+
+
+def test_k8s_chart_resolution_never_hard_fails():
+    from rc_repro.services import k8s
+    # nothing at or below the request: newest chart, with a warning
+    events_seen = []
+    assert k8s.resolve_chart_version("1.0.0", _FakeRun(),
+                                     emit=events_seen.append) == "7.0.2"
+    assert any(e.level == "warn" for e in events_seen)
+    # unreadable index: fall back to letting helm choose rather than failing
+    events_seen.clear()
+    assert k8s.resolve_chart_version("8.6.1", _FakeRun(index=[]),
+                                     emit=events_seen.append) == ""
+    assert any("not fully pinned" in e.message for e in events_seen)
