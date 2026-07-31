@@ -34,7 +34,7 @@ import yaml
 from dataclasses import dataclass, field
 
 from rc_repro import runner, versions
-from rc_repro.errors import DockerError, ValidationError
+from rc_repro.errors import CreateFailedError, DockerError, ValidationError
 from rc_repro.services import events
 from rc_repro.services.events import Emit, null_emit
 
@@ -79,6 +79,10 @@ class _Runner:
         return subprocess.run(
             ["kubectl", "--context", ctx, "-n", ns, "apply", "-f", "-"],
             input=manifest, capture_output=True, text=True, check=True)
+
+    def sleep(self, seconds: float) -> None:
+        import time
+        time.sleep(seconds)
 
     def port_forward(self, ctx: str, ns: str, host_port: int) -> int:
         """Start kubectl port-forward detached and return its pid.
@@ -161,6 +165,59 @@ def check_mongo_kernel_support(mongo_tag: str, run: _Runner | None = None) -> No
             f"{kernel[0]}.{kernel[1]} (SERVER-121912), and this Rocket.Chat "
             f"version requires it. Use an older Rocket.Chat line (7.x pairs with "
             f"MongoDB 7.0) or an engine on a kernel below 6.19.")
+
+
+#: How long to wait for the MongoDB pod, and how often to look.
+_MONGO_READY_TRIES = 60
+_MONGO_READY_INTERVAL = 5.0
+
+_RS_INITIATE = ('rs.initiate({_id:"rs0",'
+                'members:[{_id:0,host:"mongo-0.mongo:27017"}]})')
+
+
+def init_replica_set(run: _Runner, ctx: str, ns: str, emit: Emit = null_emit) -> None:
+    """Wait for MongoDB, then initiate the single-node replica set, and verify it.
+
+    Rocket.Chat needs change streams, which need a replica set, so an uninitiated
+    MongoDB produces a repro that never becomes ready. This used to swallow its own
+    failures: `kubectl wait` was called the instant after `apply`, before the pod
+    existed, so it failed immediately and rs.initiate then ran against nothing.
+    Both errors were discarded and the repro was reported as created.
+
+    So: poll for the pod (it does not exist yet right after apply), initiate,
+    tolerate an already-initiated set, and *verify* rather than assume. A genuine
+    failure raises CreateFailedError, which is exit 7: known dead, stop now, rather
+    than letting the caller wait out a timeout.
+    """
+    for attempt in range(_MONGO_READY_TRIES):
+        res = _kubectl(run, ctx, "-n", ns, "get", "pod", "mongo-0",
+                       "-o", "jsonpath={.status.containerStatuses[0].ready}",
+                       check=False)
+        if (res.stdout or "").strip() == "true":
+            break
+        if attempt % 6 == 0:
+            events.info(emit, "waiting for MongoDB to be ready", phase="wait")
+        run.sleep(_MONGO_READY_INTERVAL)
+    else:
+        raise CreateFailedError(
+            "MongoDB did not become ready; the repro cannot work without it "
+            f"(kubectl -n {ns} describe pod mongo-0)")
+
+    events.info(emit, "initiating the replica set", phase="boot", pct=45)
+    res = _kubectl(run, ctx, "-n", ns, "exec", "mongo-0", "--", "mongosh",
+                   "--quiet", "--eval", _RS_INITIATE, check=False)
+    combined = f"{res.stdout or ''}{res.stderr or ''}"
+    if res.returncode != 0 and "already initialized" not in combined.lower():
+        raise CreateFailedError(f"could not initiate the MongoDB replica set: {combined.strip()[:400]}")
+
+    # Verify rather than trust the exit code: this is the step whose silent failure
+    # produced a repro that looked created and could never become ready.
+    ok = _kubectl(run, ctx, "-n", ns, "exec", "mongo-0", "--", "mongosh",
+                  "--quiet", "--eval", "rs.status().ok", check=False)
+    if (ok.stdout or "").strip() != "1":
+        raise CreateFailedError(
+            "the MongoDB replica set is not initiated, so Rocket.Chat's change "
+            "streams cannot work: " + (ok.stdout or ok.stderr or "").strip()[:300])
 
 
 def build_values(rc_version: str, *, offline: bool = False,
@@ -310,14 +367,7 @@ def create_repro(name: str, rc_version: str, *, offline: bool = False,
     events.info(emit, f"starting MongoDB {plan.mongo_tag}", phase="boot", pct=30)
     run.apply(ctx, plan.namespace, _mongo_manifest(name, plan.mongo_tag))
     events.info(emit, "waiting for MongoDB", phase="wait", pct=40)
-    _kubectl(run, ctx, "-n", plan.namespace, "wait", "--for=condition=Ready",
-             "pod/mongo-0", "--timeout=180s", check=False)
-    # A single-node replica set must be initiated once; re-running rs.initiate on
-    # an initiated set is an error, so failure here is expected on reuse.
-    _kubectl(run, ctx, "-n", plan.namespace, "exec", "mongo-0", "--",
-             "mongosh", "--quiet", "--eval",
-             'rs.initiate({_id:"rs0",members:[{_id:0,host:"mongo-0.mongo:27017"}]})',
-             check=False)
+    init_replica_set(run, ctx, plan.namespace, emit)
 
     events.info(emit, "installing the Rocket.Chat chart", phase="boot", pct=55)
     run.run(["helm", "repo", "add", HELM_REPO_NAME, HELM_REPO_URL], check=False)

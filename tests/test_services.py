@@ -246,8 +246,10 @@ class _FakeRun:
     """Records every external command instead of running it."""
 
     def __init__(self, *, tools=("kind", "kubectl", "helm"), clusters="",
-                 kernel="6.8.0-generic", labels='{"app.kubernetes.io/managed-by":"rc-repro"}'):
+                 kernel="6.8.0-generic", labels='{"app.kubernetes.io/managed-by":"rc-repro"}',
+                 mongo_ready="true", rs_ok="1"):
         self.tools, self.clusters, self.kernel, self.labels = tools, clusters, kernel, labels
+        self.mongo_ready, self.rs_ok = mongo_ready, rs_ok
         self.calls: list[list[str]] = []
         self.applied: list[str] = []
         self.installed: list[dict] = []
@@ -266,6 +268,12 @@ class _FakeRun:
             out = self.kernel
         elif "jsonpath={.metadata.labels}" in argv:
             out = self.labels
+        elif "jsonpath={.status.containerStatuses[0].ready}" in argv:
+            out = self.mongo_ready
+        elif "rs.status().ok" in argv:
+            out = self.rs_ok
+        elif any("rs.initiate" in a for a in argv):
+            out = "{ ok: 1 }"
         return subprocess.CompletedProcess(argv, 0, out, "")
 
     def apply(self, ctx, ns, manifest):
@@ -273,6 +281,9 @@ class _FakeRun:
 
     def install(self, ctx, ns, values):
         self.installed.append(values)
+
+    def sleep(self, seconds):
+        pass          # never actually wait in tests
 
     def port_forward(self, ctx, ns, host_port):
         self.forwards.append((ns, host_port))
@@ -412,3 +423,42 @@ def test_k8s_teardown_with_volumes_forgets_the_record(tmp_path, monkeypatch):
     assert f"record/t5" in out["removed"]
     assert not runner.exists("t5")
     assert out["residual"] == []
+
+
+def test_k8s_fails_loudly_when_the_replica_set_is_not_initiated():
+    """Regression: this silently produced a repro that could never become ready.
+
+    kubectl wait was called the instant after apply, before the pod existed, so it
+    failed immediately; rs.initiate then ran against nothing. Both errors were
+    discarded with check=False and the repro was reported as successfully created.
+    Found by running the real code against a real cluster, where MongoDB reported
+    NotYetInitialized.
+    """
+    from rc_repro.services import k8s
+    # replica set never comes up -> exit 7, known dead, rather than a slow timeout
+    with pytest.raises(errors.CreateFailedError) as ei:
+        k8s.init_replica_set(_FakeRun(rs_ok="0"), "ctx", "ns")
+    assert "change streams" in str(ei.value)
+    assert errors.CreateFailedError.exit_code == 7
+
+
+def test_k8s_fails_when_mongo_never_becomes_ready():
+    from rc_repro.services import k8s
+    with pytest.raises(errors.CreateFailedError) as ei:
+        k8s.init_replica_set(_FakeRun(mongo_ready=""), "ctx", "ns")
+    assert "did not become ready" in str(ei.value)
+
+
+def test_k8s_tolerates_an_already_initiated_replica_set():
+    # Re-running create against a reused namespace must not fail on this.
+    from rc_repro.services import k8s
+
+    class AlreadyInit(_FakeRun):
+        def run(self, argv, *, check=True):
+            import subprocess
+            if any("rs.initiate" in a for a in argv):
+                self.calls.append(argv)
+                return subprocess.CompletedProcess(argv, 1, "", "already initialized")
+            return super().run(argv, check=check)
+
+    k8s.init_replica_set(AlreadyInit(), "ctx", "ns")   # no raise
