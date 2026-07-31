@@ -33,7 +33,7 @@ import subprocess
 import yaml
 from dataclasses import dataclass, field
 
-from rc_repro import versions
+from rc_repro import runner, versions
 from rc_repro.errors import DockerError, ValidationError
 from rc_repro.services import events
 from rc_repro.services.events import Emit, null_emit
@@ -79,6 +79,18 @@ class _Runner:
         return subprocess.run(
             ["kubectl", "--context", ctx, "-n", ns, "apply", "-f", "-"],
             input=manifest, capture_output=True, text=True, check=True)
+
+    def port_forward(self, ctx: str, ns: str, host_port: int) -> int:
+        """Start kubectl port-forward detached and return its pid.
+
+        Part of the seam so tests never spawn a real forward.
+        """
+        proc = subprocess.Popen(
+            ["kubectl", "--context", ctx, "-n", ns, "port-forward",
+             "svc/rc-rocketchat", f"{host_port}:80"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+        return proc.pid
 
     def install(self, ctx: str, ns: str, values: dict) -> subprocess.CompletedProcess:
         """helm install with values on stdin, so no temp file is left behind."""
@@ -275,8 +287,8 @@ def _mongo_manifest(name: str, tag: str) -> str:
 
 
 def create_repro(name: str, rc_version: str, *, offline: bool = False,
-                 rc_image: str = "", mongo: str = "", emit: Emit = null_emit,
-                 run: _Runner | None = None) -> dict:
+                 rc_image: str = "", mongo: str = "", port: int = 0,
+                 emit: Emit = null_emit, run: _Runner | None = None) -> dict:
     """Create a Kubernetes microservices repro. Returns the result payload."""
     run = run or _Runner()
     require_tools(run)
@@ -313,9 +325,33 @@ def create_repro(name: str, rc_version: str, *, offline: bool = False,
     run.install(ctx, plan.namespace, plan.values)
 
     events.info(emit, "chart installed", phase="wait", pct=70)
+
+    # Reachability, and the metadata that makes this repro visible to list/info/
+    # resolve_name exactly like a Compose one. Metadata is shared deliberately: a
+    # second record format would be a second thing to keep in sync.
+    host_port = port or runner.pick_port()
+    pid = start_port_forward(ctx, plan.namespace, host_port, run)
+    resolved = versions.resolve(plan.rc_version, offline=offline)
+    meta = runner.Metadata(
+        name=name, project=plan.namespace, rc_version=plan.rc_version,
+        rc_image=plan.rc_image, mongo_tag=plan.mongo_tag,
+        mongo_flavor=resolved.mongo_flavor, preset="microservices",
+        root_url=f"http://localhost:{host_port}", host_port=host_port,
+        version_source=resolved.source,
+        extra={_TOPOLOGY: "kubernetes", _NAMESPACE: plan.namespace,
+               _CONTEXT: ctx, _FORWARD_PID: pid},
+    )
+    # The workspace holds the rendered artifact, values.yaml here instead of
+    # docker-compose.yml, so evidence hashes the same kind of thing either way.
+    runner.write(name, yaml.safe_dump(plan.values, sort_keys=False), meta,
+                 artifact_name="values.yaml")
+    events.info(emit, f"forwarding localhost:{host_port}", phase="wait", pct=80)
+
     return {"name": name, "namespace": plan.namespace, "context": ctx,
             "topology": "kubernetes", "rc_version": plan.rc_version,
-            "mongo_tag": plan.mongo_tag, "chart": CHART}
+            "mongo_tag": plan.mongo_tag, "chart": CHART,
+            "root_url": meta.root_url, "host_port": host_port,
+            "port_forward": "up"}
 
 
 def teardown(name: str, *, volumes: bool = False, emit: Emit = null_emit,
@@ -338,6 +374,13 @@ def teardown(name: str, *, volumes: bool = False, emit: Emit = null_emit,
         # it is not ours, which is never ours to delete.
         return {"name": name, "removed": [], "residual": [], "volumes_removed": False}
 
+    try:
+        meta = runner.read_meta(name)
+    except Exception:  # noqa: BLE001 - record may already be gone
+        meta = None
+    if meta is not None and stop_port_forward(meta):
+        events.info(emit, "stopped the port-forward", phase="teardown", pct=20)
+
     events.info(emit, f"deleting namespace {ns}", phase="teardown", pct=50)
     res = _kubectl(run, ctx, "delete", "namespace", ns, "--wait=true", check=False)
     if res.returncode == 0:
@@ -352,5 +395,85 @@ def teardown(name: str, *, volumes: bool = False, emit: Emit = null_emit,
             if name in vol:
                 residual.append(f"pv/{vol}")
 
+    if volumes:
+        # --volumes means forget the repro entirely, matching the Compose path.
+        runner.remove(name)          # rmtree, ignore_errors: idempotent by design
+        removed.append(f"record/{name}")
+
     return {"name": name, "removed": removed, "residual": residual,
             "volumes_removed": bool(volumes)}
+
+
+# --- reachability: the port-forward is reconcilable state ----------------------
+#
+# A port-forward is a child process that dies with the CLI. Rather than pretend
+# otherwise, it is treated as state that any operation may re-establish: `up`
+# starts it and records the pid, anything needing HTTP probes it first and revives
+# it if dead, and `down` kills it. Without that, every verb inherits a flaky
+# precondition.
+#
+# Why a forward at all: kind fixes extraPortMappings at cluster creation, but one
+# warm cluster outlives many repros, so a NodePort block would cap concurrency at
+# whatever was reserved up front. A forward is the only per-repro option, and it
+# keeps host_port and root_url meaning exactly what they mean on the Docker path.
+
+_FORWARD_PID = "k8s_forward_pid"
+_NAMESPACE = "k8s_namespace"
+_CONTEXT = "k8s_context"
+_TOPOLOGY = "topology"
+
+
+def _pid_alive(pid: int) -> bool:
+    import os
+    try:
+        os.kill(pid, 0)
+    except (OSError, ProcessLookupError):
+        return False
+    return True
+
+
+def start_port_forward(ctx: str, ns: str, host_port: int,
+                       run: _Runner | None = None) -> int:
+    """Start `kubectl port-forward` detached and return its pid."""
+    return (run or _Runner()).port_forward(ctx, ns, host_port)
+
+
+def ensure_port_forward(meta, emit: Emit = null_emit,
+                        run: _Runner | None = None) -> int | None:
+    """Make sure the forward is alive, restarting it if not. Returns its pid.
+
+    Idempotent and cheap, so callers can invoke it unconditionally instead of
+    tracking whether it is needed.
+    """
+    extra = meta.extra if isinstance(meta.extra, dict) else {}
+    ns, ctx = extra.get(_NAMESPACE), extra.get(_CONTEXT)
+    if not ns or not ctx:
+        return None
+    pid = extra.get(_FORWARD_PID)
+    if isinstance(pid, int) and _pid_alive(pid):
+        return pid
+    events.info(emit, "re-establishing the port-forward", phase="wait")
+    return start_port_forward(ctx, ns, meta.host_port, run)
+
+
+def stop_port_forward(meta) -> bool:
+    """Kill the recorded forward. True if one was running."""
+    import os
+    import signal
+    extra = meta.extra if isinstance(meta.extra, dict) else {}
+    pid = extra.get(_FORWARD_PID)
+    if not isinstance(pid, int) or not _pid_alive(pid):
+        return False
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return False
+    return True
+
+
+def forward_state(meta) -> str:
+    """"up" or "down". A repro whose forward died is still running in the cluster,
+    so reporting it as broken would be wrong; it is reported separately instead."""
+    extra = meta.extra if isinstance(meta.extra, dict) else {}
+    pid = extra.get(_FORWARD_PID)
+    return "up" if isinstance(pid, int) and _pid_alive(pid) else "down"

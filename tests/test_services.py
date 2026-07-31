@@ -251,6 +251,7 @@ class _FakeRun:
         self.calls: list[list[str]] = []
         self.applied: list[str] = []
         self.installed: list[dict] = []
+        self.forwards: list[tuple] = []
 
     def which(self, tool):
         return f"/usr/bin/{tool}" if tool in self.tools else None
@@ -272,6 +273,10 @@ class _FakeRun:
 
     def install(self, ctx, ns, values):
         self.installed.append(values)
+
+    def port_forward(self, ctx, ns, host_port):
+        self.forwards.append((ns, host_port))
+        return 424242          # a pid that is not alive, so probes report "down"
 
 
 def test_k8s_requires_the_toolchain():
@@ -347,3 +352,63 @@ def test_k8s_reuses_an_existing_cluster():
     fake2 = _FakeRun(clusters="")
     k8s.ensure_cluster(run=fake2)
     assert any(c[:3] == ["kind", "create", "cluster"] for c in fake2.calls)
+
+
+def test_k8s_create_persists_shared_metadata(tmp_path, monkeypatch):
+    # A Kubernetes repro must be visible to list/info/resolve_name exactly like a
+    # Compose one, so it uses the same Metadata record rather than a second format.
+    from rc_repro import runner
+    from rc_repro.services import k8s
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    fake = _FakeRun()
+    out = k8s.create_repro("t2", "8.6.1", offline=True, port=31234, run=fake)
+
+    assert runner.exists("t2")
+    m = runner.read_meta("t2")
+    assert m.preset == "microservices" and m.host_port == 31234
+    assert m.root_url == "http://localhost:31234"
+    assert m.extra["topology"] == "kubernetes"
+    assert m.extra["k8s_namespace"] == "rc-repro-t2"
+    # the workspace holds values.yaml, not docker-compose.yml
+    ws = runner.workspace("t2")
+    assert (ws / "values.yaml").exists()
+    assert not (ws / "docker-compose.yml").exists()
+    assert "microservices" in (ws / "values.yaml").read_text()
+    assert fake.forwards == [("rc-repro-t2", 31234)]
+    assert out["port_forward"] == "up"
+
+
+def test_k8s_forward_state_reports_down_without_failing_the_repro(tmp_path, monkeypatch):
+    # A repro whose forward died is still running in the cluster. Reporting it as
+    # broken would be wrong, so the forward gets its own state.
+    from rc_repro import runner
+    from rc_repro.services import k8s
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    k8s.create_repro("t3", "8.6.1", offline=True, port=31235, run=_FakeRun())
+    m = runner.read_meta("t3")
+    assert k8s.forward_state(m) == "down"        # the fake pid is not alive
+    assert k8s.stop_port_forward(m) is False     # nothing to kill, not an error
+
+
+def test_k8s_ensure_port_forward_revives_a_dead_one(tmp_path, monkeypatch):
+    from rc_repro import runner
+    from rc_repro.services import k8s
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    fake = _FakeRun()
+    k8s.create_repro("t4", "8.6.1", offline=True, port=31236, run=fake)
+    m = runner.read_meta("t4")
+    fake.forwards.clear()
+    assert k8s.ensure_port_forward(m, run=fake) == 424242
+    assert fake.forwards == [("rc-repro-t4", 31236)]   # re-established
+
+
+def test_k8s_teardown_with_volumes_forgets_the_record(tmp_path, monkeypatch):
+    from rc_repro import runner
+    from rc_repro.services import k8s
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    k8s.create_repro("t5", "8.6.1", offline=True, port=31237, run=_FakeRun())
+    assert runner.exists("t5")
+    out = k8s.teardown("t5", volumes=True, run=_FakeRun())
+    assert f"record/t5" in out["removed"]
+    assert not runner.exists("t5")
+    assert out["residual"] == []
