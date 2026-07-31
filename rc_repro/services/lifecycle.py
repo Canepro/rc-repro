@@ -518,6 +518,12 @@ def detail(name: str) -> dict:
     containers + the RC service's env vars."""
     target = resolve_name(name)
     m = runner.read_meta(target)
+    # Topology dispatch, same one-line pattern as create_repro. The Kubernetes
+    # record uses the identical {service, state, status} container shape, so a
+    # caller reads it without knowing which topology produced it.
+    if isinstance(m.extra, dict) and m.extra.get("topology") == "kubernetes":
+        from rc_repro.services import k8s
+        return k8s.detail(target)
     d = _summary(m)
     containers = runner.container_details(target)
     rc = [c for c in containers if c["service"] == "rocketchat" or c["service"].startswith("rocketchat-")]

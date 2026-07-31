@@ -511,3 +511,52 @@ def test_k8s_chart_resolution_never_hard_fails():
     assert k8s.resolve_chart_version("8.6.1", _FakeRun(index=[]),
                                      emit=events_seen.append) == ""
     assert any("not fully pinned" in e.message for e in events_seen)
+
+
+def test_k8s_pods_map_to_the_compose_container_shape(tmp_path, monkeypatch):
+    # The mapping is the point: a caller reads `info` identically on both
+    # topologies, which is what keeps the Kubernetes path invisible to consumers.
+    import json as _j
+    from rc_repro.services import k8s
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    k8s.create_repro("p1", "8.6.1", offline=True, port=31300, run=_FakeRun())
+
+    class WithPods(_FakeRun):
+        def run(self, argv, *, check=True):
+            import subprocess
+            if argv[-1] == "json" and "pods" in argv:
+                self.calls.append(argv)
+                return subprocess.CompletedProcess(argv, 0, _j.dumps({"items": [
+                    {"metadata": {"name": "rc-rocketchat-x"}, "status": {
+                        "phase": "Running",
+                        "containerStatuses": [{"ready": True, "restartCount": 0}]}},
+                    {"metadata": {"name": "rc-ddp-streamer-y"}, "status": {
+                        "phase": "Running",
+                        "containerStatuses": [{"ready": False, "restartCount": 2}]}},
+                ]}), "")
+            return super().run(argv, check=check)
+
+    got = k8s.pods("p1", WithPods())
+    assert [p["service"] for p in got] == ["rc-ddp-streamer-y", "rc-rocketchat-x"]
+    assert got[1] == {"service": "rc-rocketchat-x", "state": "running",
+                      "status": "1/1 ready"}
+    # restarts are surfaced, since they are how a transient failure shows up
+    assert "2 restart(s)" in got[0]["status"]
+
+    d = k8s.detail("p1", WithPods())
+    assert d["topology"] == "kubernetes" and d["namespace"] == "rc-repro-p1"
+    assert d["state"] == "starting"          # not everything is ready yet
+    # the forward is reported apart from state: a dead forward does not mean the
+    # repro is broken, it means the tunnel needs re-establishing
+    assert d["port_forward"] == "down"
+    assert d["links"][0]["url"] == "http://localhost:31300"
+
+
+def test_lifecycle_detail_dispatches_to_kubernetes(tmp_path, monkeypatch):
+    from rc_repro.services import k8s
+    from rc_repro.services import lifecycle as lc
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    k8s.create_repro("p2", "8.6.1", offline=True, port=31301, run=_FakeRun())
+    # would raise on a Compose-only path (no docker-compose.yml exists here)
+    d = lc.detail("p2")
+    assert d["topology"] == "kubernetes"

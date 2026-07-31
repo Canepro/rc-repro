@@ -603,3 +603,92 @@ def forward_state(meta) -> str:
     extra = meta.extra if isinstance(meta.extra, dict) else {}
     pid = extra.get(_FORWARD_PID)
     return "up" if isinstance(pid, int) and _pid_alive(pid) else "down"
+
+
+# --- inspection ----------------------------------------------------------------
+
+def pods(name: str, run: _Runner | None = None) -> list[dict]:
+    """The repro's pods, mapped to the same shape Compose reports for services.
+
+    Deliberately identical to `{service, state, status}` so a caller reads `info`
+    the same way on both topologies. That mapping is most of what makes the
+    Kubernetes path invisible to consumers.
+    """
+    run = run or _Runner()
+    meta = runner.read_meta(name)
+    extra = meta.extra if isinstance(meta.extra, dict) else {}
+    ns, ctx = extra.get(_NAMESPACE), extra.get(_CONTEXT)
+    if not ns or not ctx:
+        return []
+    res = _kubectl(run, ctx, "-n", ns, "get", "pods", "-o", "json", check=False)
+    try:
+        items = json.loads(res.stdout or "{}").get("items", [])
+    except ValueError:
+        return []
+    out = []
+    for item in items:
+        status = item.get("status", {})
+        conts = status.get("containerStatuses") or []
+        ready = sum(1 for c in conts if c.get("ready"))
+        restarts = sum(int(c.get("restartCount") or 0) for c in conts)
+        out.append({
+            "service": item.get("metadata", {}).get("name", ""),
+            "state": (status.get("phase") or "unknown").lower(),
+            "status": f"{ready}/{len(conts)} ready" +
+                      (f", {restarts} restart(s)" if restarts else ""),
+        })
+    return sorted(out, key=lambda p: p["service"])
+
+
+def aggregate_state(pod_list: list[dict]) -> str:
+    """One word for the whole repro, matching how Compose aggregates services."""
+    if not pod_list:
+        return "down"
+    if all(p["status"].startswith(tuple(f"{n}/{n}" for n in range(1, 6)))
+           for p in pod_list):
+        return "running"
+    if any(p["state"] == "running" for p in pod_list):
+        return "starting"
+    return "stopped"
+
+
+def detail(name: str, run: _Runner | None = None) -> dict:
+    """The same detail record the Compose path returns, for a Kubernetes repro.
+
+    `port_forward` is reported separately rather than folded into `state`: a repro
+    whose forward died is still running in the cluster, so conflating them would
+    report a healthy repro as broken.
+    """
+    meta = runner.read_meta(name)
+    extra = meta.extra if isinstance(meta.extra, dict) else {}
+    pod_list = pods(name, run)
+    return {
+        "name": meta.name,
+        "preset": meta.preset,
+        "rc_version": meta.rc_version,
+        "mongo_tag": meta.mongo_tag,
+        "root_url": meta.root_url,
+        "host_port": meta.host_port,
+        "topology": "kubernetes",
+        "namespace": extra.get(_NAMESPACE, ""),
+        "context": extra.get(_CONTEXT, ""),
+        "state": aggregate_state(pod_list),
+        "containers": pod_list,
+        "port_forward": forward_state(meta),
+        "links": [{"label": "Rocket.Chat", "url": meta.root_url}],
+    }
+
+
+def logs(name: str, *, follow: bool = False, tail: int | None = None,
+         run: _Runner | None = None) -> int:
+    """Stream the Rocket.Chat deployment's logs, mirroring `compose logs`."""
+    run = run or _Runner()
+    meta = runner.read_meta(name)
+    extra = meta.extra if isinstance(meta.extra, dict) else {}
+    argv = ["kubectl", "--context", extra.get(_CONTEXT, ""), "-n",
+            extra.get(_NAMESPACE, ""), "logs", "deployment/rc-rocketchat"]
+    if follow:
+        argv.append("--follow")
+    if tail is not None:
+        argv.append(f"--tail={tail}")
+    return subprocess.call(argv)
