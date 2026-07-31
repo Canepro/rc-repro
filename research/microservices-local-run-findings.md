@@ -3,9 +3,12 @@
 Evidence from actually standing the official chart's microservices topology up on a local
 kind cluster, for [Canepro/rc-repro#12](https://github.com/Canepro/rc-repro/issues/12).
 
-**Status: the footprint floor is NOT established by this run.** The host is not a
-representative baseline. What this run did establish is a failure matrix that rc-repro's
-preflight has to detect, which is arguably the more useful output.
+**Status: the floor IS now established**, but on a second host. Two runs are recorded here:
+
+1. **arm64 / Podman / kernel 6.19 (macOS)**, below. Established a *failure matrix* rather
+   than a floor, because Rocket.Chat 8.2+ cannot run microservices on that host at all.
+2. **amd64 / Docker / kernel 6.8 (Linux VPS)**, in the "Measured floor" section at the end.
+   This is the representative baseline and is where the numbers come from.
 
 ## Host
 
@@ -161,7 +164,101 @@ documented.
 - **#4, runtime:** the Kubernetes preflight must reuse `doctor`'s existing kernel check
   (`cli.py:1645`), and should add an image-architecture check, since a wrong-arch pull is a
   terminal failure that looks like a network problem.
-- **#12, floor:** still open. It needs a representative Docker on Linux amd64 host. This run
-  should be treated as the failure matrix, not the measurement.
-- **#13, licence:** not answered here. Rocket.Chat never reached a ready state long enough to
-  test whether microservices function under a Cloud-registered licence.
+- **#13, licence:** not answered. Rocket.Chat never held a ready state long enough on the
+  arm64 host, and the amd64 run was deliberately unlicensed to keep the floor measurement
+  clean.
+
+---
+
+# Measured floor: amd64, Docker, kernel 6.8
+
+Second run, on the representative baseline. This is where the floor numbers come from.
+
+## Host
+
+| Piece | Value |
+|---|---|
+| Host | Linux VPS, x86_64, 15 GiB RAM, **4 CPUs** |
+| Kernel | `6.8.0-117-generic` (below the 6.19 MongoDB cutoff) |
+| Engine | Docker 29.6.1 |
+| kind | v0.32.0, node `kindest/node:v1.36.1`, 4 CPUs and 16376020Ki allocatable |
+| Chart | `rocketchat` 7.0.2 (appVersion 8.6.1), microservices enabled |
+| MongoDB | `bitnamilegacy/mongodb:8.0.13-debian-12-r0`, the chart's own subchart |
+
+On amd64 the Bitnami MongoDB 8.0 image exists and kernel 6.8 is below the SERVER-121912
+cutoff, so **the chart's bundled MongoDB works here with only a tag override.** No external
+MongoDB was needed. Rocket.Chat 8.6.1 came up `1/1 Running` against MongoDB 8.0.13,
+confirming that finding 3's failure is purely the chart's *default tag*, not the subchart.
+
+## Timings
+
+| Phase | Time |
+|---|---|
+| kind cluster creation | **24 s** |
+| Cold convergence, all 9 pods ready, including image pulls | **168 s** |
+| Warm convergence, images already present | **82 s** |
+
+The cold-to-warm ratio is roughly 2x, which supports #4's decision to keep the cluster warm
+across repros rather than create one per repro.
+
+## Resource measurements
+
+Measured on the kind node container, which is the whole cluster:
+
+| Measure | Idle, all ready | Peak during convergence |
+|---|---|---|
+| Memory working set | **2.71 GiB** | **3.49 GiB** |
+| Memory incl. page cache (cgroup) | 4.41 GiB | not sampled |
+| CPU | ~21.5% of 4 cores (~0.86 cores) | **88.0% of 4 cores (~3.5 cores)** |
+
+Per-container working set at idle, top entries:
+
+| Component | MiB |
+|---|---|
+| `rocketchat` (monolith) | **720.0** |
+| `kube-apiserver` | 220.1 |
+| `mongodb` | 188.2 |
+| `ddp-streamer` | 59.5 |
+| `authorization-service` | 58.3 |
+| `presence-service` | 57.6 |
+| `account-service` | 53.7 |
+| `nats-box` | 0.3 |
+| Sum of all containers | 1553.5 |
+
+**The four microservices cost roughly 230 MiB combined.** The monolith Rocket.Chat process
+dominates at 720 MiB. So choosing the microservices topology is not primarily a memory
+decision; its cost is pod count and startup CPU.
+
+## Recommended preflight floor
+
+| Resource | Floor | Recommended |
+|---|---|---|
+| Allocatable memory | **6 GiB** | 8 GiB |
+| Allocatable CPU | **4 cores** | 4 cores |
+
+Reasoning: peak working set is 3.49 GiB and the cgroup total including page cache reaches
+4.41 GiB, so 4 GiB is too tight to be safe and 6 GiB is the lowest defensible floor. Peak CPU
+wants about 3.5 cores, so a 4-core floor is real and **a memory-only floor would have missed
+the binding constraint**. Two cores would stretch startup far enough to risk probe-driven
+restart loops, which is the `ddp-streamer` exit-143 pattern seen on both hosts.
+
+This also retroactively confirms that Podman's 2 GiB default is hopeless and that the 6 GiB
+the arm64 host was resized to is about the true minimum, not a generous allowance.
+
+## Limits of these numbers
+
+- **Idle only.** No workload traffic, no seeding, no load test. rc-repro's own `seed` and
+  `loadtest` paths will push memory and CPU above these figures.
+- **Peak CPU is a spot reading** from 5 samples during a restart storm. It is corroborated by
+  an independent 86.8%-of-5-cores reading on the arm64 host, but it is not a rigorous
+  percentile.
+- **Peak memory including page cache was not sampled**, only the working set.
+- **Single-node cluster.** A multi-node kind cluster would add a kubelet and containerd per
+  node.
+- Unlicensed, so nothing here reflects whatever the enterprise licence path costs.
+
+## Cleanup
+
+Cluster deleted, release uninstalled, no kind clusters remain, and the host returned to
+2.2 GiB used with 13 GiB available. Two binaries were installed at `/usr/local/bin/kind` and
+`/usr/local/bin/helm` and were intentionally left in place for future runs.
