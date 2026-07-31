@@ -16,13 +16,26 @@ establishes `research/` as the convention for Wayfinder research output.
 Adopt the **Agent Skills open standard** (`SKILL.md` with `name` + `description` frontmatter, plus
 `references/`, `scripts/`, `assets/`) as the canonical format, and restrict the frontmatter to the
 fields the published spec defines. The premise of the ticket is now weaker than the map assumed, in a
-good way: the four agent hosts I checked (Claude Code, OpenAI Codex, Cursor, GitHub Copilot) all read
-that exact file format from disk, so there is **no format to translate and no divergent copy to
-maintain**. What remains is a *directory placement* problem plus a *version stamping* problem. The
-minimal adapter set is two directory entry points in the repository (`.agents/skills/rc-repro/` and
-`.claude/skills/rc-repro/`), both pointing at one canonical body, plus one `rc-repro skill install`
-subcommand for the pipx user who has no repository checkout. The genuinely non-portable parts are
-tool permissioning and glob scoping, and those must not carry rc-repro's safety gates.
+good way: all five agent hosts I checked (Claude Code, OpenAI Codex, GitHub Copilot, Gemini CLI, and
+Cursor) read that exact file format and layout from disk, so there is **no format to translate and no
+divergent copy to maintain**. What remains is a *directory placement* problem plus a *version
+stamping* problem. Two destinations cover every host: `.agents/skills/rc-repro/` is read by Codex,
+Copilot, Gemini CLI, and Cursor, and `.claude/skills/rc-repro/` is read by Claude Code, Copilot, and
+Cursor. Add one `rc-repro skill install` subcommand for the pipx user who has no repository checkout,
+and the strategy is complete. Two caveats bound the answer: Cursor's own blog says Agent Skills are
+nightly-only (section 3), and the genuinely non-portable parts are tool permissioning and glob
+scoping, so rc-repro's safety gates must be enforced by rc-repro's CLI rather than declared in
+frontmatter (section 7, item 4).
+
+This file holds the primary answer for ticket #3, but it is **not** the only findings file on this
+branch. An earlier commit (`5fae92b`) put a parallel, independent read at
+`docs/research/agent-skill-portability.md`. Consolidation into a single file was started and never
+finished: the research agent hit a spend limit mid-merge, so roughly 17 citations that exist only in
+the `docs/` copy, including the `agentskills.io` specification anchors and the Gemini CLI and Copilot
+skill docs, are **not** present here. Both reads reach the same conclusion on format and adapters, so
+the decision stands, but merging the two files into one canonical artifact is outstanding work. Two
+files answering one ticket is the divergent-copy failure this ticket is about, and that irony is
+noted rather than hidden.
 
 ## 1. Recommended canonical format, and why
 
