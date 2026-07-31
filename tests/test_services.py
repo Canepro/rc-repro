@@ -237,3 +237,113 @@ def test_event_model_and_emit():
     assert seen[1].level == "warn"
     d = seen[0].as_dict()
     assert d["message"] == "hello" and d["terminal"] is False
+
+
+# --- Kubernetes topology (no cluster required) ---------------------------------
+
+
+class _FakeRun:
+    """Records every external command instead of running it."""
+
+    def __init__(self, *, tools=("kind", "kubectl", "helm"), clusters="",
+                 kernel="6.8.0-generic", labels='{"app.kubernetes.io/managed-by":"rc-repro"}'):
+        self.tools, self.clusters, self.kernel, self.labels = tools, clusters, kernel, labels
+        self.calls: list[list[str]] = []
+        self.applied: list[str] = []
+        self.installed: list[dict] = []
+
+    def which(self, tool):
+        return f"/usr/bin/{tool}" if tool in self.tools else None
+
+    def run(self, argv, *, check=True):
+        import subprocess
+        self.calls.append(argv)
+        out = ""
+        if argv[:3] == ["kind", "get", "clusters"]:
+            out = self.clusters
+        elif argv[:2] == ["docker", "info"]:
+            out = self.kernel
+        elif "jsonpath={.metadata.labels}" in argv:
+            out = self.labels
+        return subprocess.CompletedProcess(argv, 0, out, "")
+
+    def apply(self, ctx, ns, manifest):
+        self.applied.append(manifest)
+
+    def install(self, ctx, ns, values):
+        self.installed.append(values)
+
+
+def test_k8s_requires_the_toolchain():
+    from rc_repro.services import k8s
+    with pytest.raises(errors.DockerError) as ei:
+        k8s.require_tools(_FakeRun(tools=("kubectl",)))
+    msg = str(ei.value)
+    assert "kind" in msg and "helm" in msg      # names what is missing
+    k8s.require_tools(_FakeRun())               # all present: no raise
+
+
+def test_k8s_refuses_mongo8_on_a_619_kernel():
+    # RC 8.2+ needs MongoDB 8.0, which hard-exits on kernel 6.19+ (SERVER-121912).
+    # That is impossible, not slow, so it must fail preflight rather than time out.
+    from rc_repro.services import k8s
+    with pytest.raises(errors.ValidationError) as ei:
+        k8s.check_mongo_kernel_support("8.0", _FakeRun(kernel="6.19.7-200.fc43.aarch64"))
+    assert "SERVER-121912" in str(ei.value)
+    # MongoDB 7.0 is unaffected on the same kernel
+    k8s.check_mongo_kernel_support("7.0", _FakeRun(kernel="6.19.7-200.fc43.aarch64"))
+    # and MongoDB 8.0 is fine on an older kernel
+    k8s.check_mongo_kernel_support("8.0", _FakeRun(kernel="6.8.0-117-generic"))
+
+
+def test_k8s_values_never_use_the_bundled_mongodb():
+    # The chart's Bitnami MongoDB is amd64-only and its default tag is rejected by
+    # the chart's own appVersion, so the bundled subchart is always disabled.
+    from rc_repro.services import k8s
+    v = k8s.build_values("8.6.1", offline=True).values
+    assert v["mongodb"]["enabled"] is False
+    assert v["microservices"]["enabled"] is True
+    assert "replicaSet=rs0" in v["externalMongodbUrl"]   # change streams need it
+    assert v["image"]["tag"] == "8.6.1"
+    # RC 8.x deprecated the oplog URL; 7.x still wants it
+    assert "externalMongodbOplogUrl" not in v
+    assert "externalMongodbOplogUrl" in k8s.build_values("7.10.13", offline=True).values
+
+
+def test_k8s_create_labels_for_ownership_and_installs_the_chart():
+    from rc_repro.services import k8s
+    fake = _FakeRun()
+    out = k8s.create_repro("t1", "8.6.1", offline=True, run=fake)
+    assert out["namespace"] == "rc-repro-t1" and out["topology"] == "kubernetes"
+    flat = [" ".join(c) for c in fake.calls]
+    # ownership is asserted at creation, so teardown can prove what it may delete
+    assert any("label namespace rc-repro-t1" in c and "managed-by=rc-repro" in c
+               for c in flat)
+    # every kubectl call passes an explicit context: the ambient one is never used
+    assert all("--context" in c for c in fake.calls if c[0] == "kubectl")
+    assert fake.applied and "replSet" in fake.applied[0]   # replica set, not standalone
+    assert fake.installed and fake.installed[0]["mongodb"]["enabled"] is False
+
+
+def test_k8s_teardown_refuses_a_namespace_it_does_not_own():
+    from rc_repro.services import k8s
+    # No ownership label -> not ours -> nothing is deleted, and that is not an error
+    fake = _FakeRun(labels="{}")
+    out = k8s.teardown("t1", run=fake)
+    assert out["removed"] == [] and out["residual"] == []
+    assert not any("delete namespace" in " ".join(c) for c in fake.calls)
+    # Labelled -> ours -> deleted, and reported
+    fake2 = _FakeRun()
+    out2 = k8s.teardown("t1", run=fake2)
+    assert out2["removed"] == ["namespace/rc-repro-t1"]
+    assert out2["residual"] == []
+
+
+def test_k8s_reuses_an_existing_cluster():
+    from rc_repro.services import k8s
+    fake = _FakeRun(clusters=k8s.CLUSTER_NAME)
+    k8s.ensure_cluster(run=fake)
+    assert not any(c[:3] == ["kind", "create", "cluster"] for c in fake.calls)
+    fake2 = _FakeRun(clusters="")
+    k8s.ensure_cluster(run=fake2)
+    assert any(c[:3] == ["kind", "create", "cluster"] for c in fake2.calls)
