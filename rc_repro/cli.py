@@ -13,17 +13,21 @@ import time
 from dataclasses import asdict as dc_asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import NoReturn, Optional
 
 import requests
 import typer
 
-from rc_repro import compose, config, errors, presets, perf, rcapi, runner, ui, versions
+from rc_repro import compose, config, errors, jsonout, presets, perf, rcapi, runner, ui, versions
 from rc_repro import seed as seeder
 from rc_repro.perf import report as perf_report
 from rc_repro.perf.timings import fmt_ms
 from rc_repro.services import data as datasvc
 from rc_repro.services import lifecycle as lcsvc
+from rc_repro.services import onboarding as onboardsvc
+from rc_repro.services import evidence as evidencesvc
+from rc_repro.services import skill as skillsvc
+from rc_repro.services import events
 from rc_repro.services.events import Event, null_emit
 
 app = typer.Typer(
@@ -38,23 +42,35 @@ app = typer.Typer(
 _err = ui.die  # error-exit (red on stderr + exit 1), kept under the local name
 
 
+def _fail(exc: errors.ReproError) -> NoReturn:
+    """Exit on a domain error, using the exit code its class defines.
+
+    One line per handler instead of a per-site mapping, so the taxonomy in
+    errors.py stays the only place exit codes are decided.
+    """
+    ui.die(str(exc), exit_code=exc.exit_code)
+
+
 def _resolve_name(name: str | None) -> str:
-    """Return the target repro name: explicit, else the configured default."""
-    if name:
-        if not runner.exists(name):
-            _err(f"no repro named {name!r} (run `rc-repro list`)")
-        return name
-    default = config.load_config().get("default_repro")
-    if not default:
-        _err("no --name given and no default repro set (use `rc-repro use <name>`)")
-    if not runner.exists(default):
-        _err(f"default repro {default!r} no longer exists; set another with `rc-repro use`")
-    return default
+    """Return the target repro name: explicit, else the configured default.
+
+    Delegates to the service so the exit code comes from the error taxonomy
+    (missing repro -> 4, no default set -> 2) instead of a flat 1, and so this
+    doesn't drift from the identical service-layer rule.
+    """
+    try:
+        return lcsvc.resolve_name(name)
+    except errors.ReproError as exc:
+        _fail(exc)
 
 
 def _require_docker() -> None:
-    if not runner.docker_available():
-        _err("Docker isn't running. Start Docker Desktop and try again.")
+    # Delegates so "engine down" exits 3 (preflight) rather than a flat 1. This is
+    # the most common failure there is, so it is the one most worth classifying.
+    try:
+        lcsvc.require_docker()
+    except errors.ReproError as exc:
+        _fail(exc)
 
 
 def _login(meta: runner.Metadata) -> rcapi.Auth:
@@ -181,6 +197,7 @@ def up(
     force: bool = typer.Option(False, "--force", help="overwrite an existing repro"),
     monitor: bool = typer.Option(False, "--monitor", help="also add Prometheus + Grafana (RC metrics dashboard)"),
     stats: bool = typer.Option(False, "--stats", help="with --seed: report the CPU/RAM cost of seeding"),
+    json_out: bool = typer.Option(False, "--json", help="stream NDJSON progress, then one result envelope"),
 ) -> None:
     """Create and start a version-matched Rocket.Chat repro."""
     # Orchestration lives in the shared service layer (same code the web GUI
@@ -194,17 +211,41 @@ def up(
         wait=(wait or seed), offline=offline, no_pull=no_pull, fresh=fresh,
         force=force, monitor=monitor,
     )
+    if json_out:
+        writer = jsonout.EventWriter()
+        try:
+            result = lcsvc.create_repro(req, emit=writer.emit, stream_output=False)
+        except errors.ReproError as exc:
+            jsonout.fail(exc)
+        if seed:
+            # Seed through the same writer so its progress is part of one stream,
+            # rather than a second burst after the envelope.
+            summary = _run_seed(runner.read_meta(result["name"]), seed_profile,
+                                stats=False, emit=writer.emit)
+            if summary:
+                result = {**result, "seed": summary}
+        jsonout.emit(jsonout.envelope("up", result))
+        return
     try:
         result = lcsvc.create_repro(req, emit=_cli_emit, stream_output=False)
     except errors.ReproError as exc:
-        _err(str(exc))
+        _fail(exc)
     _render_create_result(result)
     if seed:
         _run_seed(runner.read_meta(result["name"]), seed_profile, stats=stats)
 
 
 def _run_seed(meta: runner.Metadata, profile: str,
-              users=None, channels=None, messages=None, stats: bool = False) -> None:
+              users=None, channels=None, messages=None, stats: bool = False,
+              emit=None) -> dict | None:
+    """Seed a repro.
+
+    `emit` routes progress through the service event stream instead of printing
+    prose. That matters under --json: stdout is reserved for envelope and event
+    objects, so a stray `typer.echo` here would corrupt the stream. When `emit` is
+    given, the caller gets the seed summary back to fold into its envelope rather
+    than a printed panel.
+    """
     try:
         auth = _login(meta)
     except Exception as exc:  # noqa: BLE001
@@ -213,18 +254,30 @@ def _run_seed(meta: runner.Metadata, profile: str,
         plan = seeder.plan_from(profile, users, channels, messages)
     except ValueError as exc:
         _err(str(exc))
-    typer.echo(
-        f"Seeding {meta.name!r} (profile: {profile} — {plan.users} users, "
-        f"{plan.channels} channels, {plan.messages} msgs/channel)…"
-    )
+    headline = (f"Seeding {meta.name!r} (profile: {profile} — {plan.users} users, "
+                f"{plan.channels} channels, {plan.messages} msgs/channel)…")
+    if emit is not None:
+        events.info(emit, headline, phase="seed")
+    else:
+        typer.echo(headline)
     mon = perf.ResourceMonitor(meta.name).start() if stats else None
     t0 = time.monotonic()
+    if emit is not None:
+        def _log(m: str) -> None:
+            events.info(emit, m, phase="seed")
+    else:
+        def _log(m: str) -> None:
+            typer.echo(f"  {m}")
     try:
-        s = seeder.seed(meta.root_url, auth, plan, log=lambda m: typer.echo(f"  {m}"))
+        s = seeder.seed(meta.root_url, auth, plan, log=_log)
     finally:
         resources = mon.stop() if mon else None   # stop the sampler thread even if seed raises
     total = time.monotonic() - t0
+    if emit is not None:
+        return {"users": plan.users, "channels": plan.channels,
+                "messages": plan.messages, "elapsed_s": round(total, 1)}
     _print_seed_result(s, total, resources, meta)
+    return None
 
 
 def _run_scale(meta: runner.Metadata, spec_str: str) -> None:
@@ -235,7 +288,7 @@ def _run_scale(meta: runner.Metadata, spec_str: str) -> None:
     try:
         res = datasvc.run_scale(meta.name, spec_str, emit=null_emit)
     except errors.ReproError as exc:
-        _err(str(exc))
+        _fail(exc)
     if "users" in res:
         ui.ok(f"✓ inserted {res['users']:,} users")
     if "messages" in res:
@@ -246,7 +299,7 @@ def _clear_scale(meta: runner.Metadata) -> None:
     try:
         res = datasvc.clear_scale(meta.name, emit=null_emit)
     except errors.ReproError as exc:
-        _err(str(exc))
+        _fail(exc)
     ui.ok(f"✓ removed {res['users']:,} scale users and {res['messages']:,} scale messages")
 
 
@@ -325,15 +378,37 @@ def _print_notes(meta: runner.Metadata) -> None:
 def ready(
     name: str = typer.Option("", "--name", "-n"),
     timeout: float = typer.Option(300.0, "--timeout", help="seconds to wait"),
+    json_out: bool = typer.Option(False, "--json", help="stream NDJSON progress, then one result envelope"),
 ) -> None:
     """Block until Rocket.Chat is serving (polls /api/info)."""
+    if json_out:
+        writer = jsonout.EventWriter()
+        try:
+            lcsvc.require_docker()
+            target = lcsvc.resolve_name(name)
+            m = runner.read_meta(target)
+            if isinstance(m.extra, dict) and m.extra.get("topology") == "kubernetes":
+                from rc_repro.services import k8s as k8ssvc
+                result = k8ssvc.wait_ready(target, timeout=timeout, emit=writer.emit)
+            else:
+                result = lcsvc.wait_and_finalize(m, emit=writer.emit, timeout=timeout)
+        except errors.ReproError as exc:
+            # NotReadyError here is exit 5: the clock ran out with the outcome
+            # still unknown, which is distinct from a known-dead create (7).
+            jsonout.fail(exc)
+        jsonout.emit(jsonout.envelope("ready", {"name": m.name, **result}))
+        return
     _require_docker()
-    m = runner.read_meta(_resolve_name(name))
+    _target = _resolve_name(name)
+    # Kubernetes reachability is a port-forward that may have died; revive it before
+    # talking HTTP, or this fails for a reason unrelated to what was asked.
+    lcsvc.ensure_reachable(_target)
+    m = runner.read_meta(_target)
     typer.echo(f"Waiting for {m.name!r} to serve {m.root_url} ...")
     try:
         result = lcsvc.wait_and_finalize(m, emit=_cli_emit, timeout=timeout)
     except errors.ReproError as exc:
-        _err(str(exc))
+        _fail(exc)
     ui.ok("✓ ready")
     _summary_panel(m, extra_rows=[("Booted in", _fmt_duration(result["booted_s"]))])
     ui.hint(f"  next: rc-repro logs --name {m.name} -f")
@@ -365,8 +440,25 @@ def down(
     name: str = typer.Option("", "--name", "-n"),
     volumes: bool = typer.Option(False, "--volumes", help="also delete the data volume and forget the repro"),
     yes: bool = typer.Option(False, "--yes", "-y", help="skip the confirmation prompt (for scripts/CI)"),
+    json_out: bool = typer.Option(False, "--json", help="emit the stable JSON result envelope"),
 ) -> None:
     """Remove a repro's containers. Keeps data (and the record) unless --volumes."""
+    if json_out:
+        writer = jsonout.EventWriter()
+        try:
+            target = lcsvc.resolve_name(name)
+            if volumes and not yes:
+                # There is nobody to prompt in JSON mode, and silently keeping the
+                # volume would contradict the flag. Refuse instead of guessing.
+                raise errors.ValidationError(
+                    "--volumes is irreversible; pass --yes to confirm it non-interactively")
+            result = lcsvc.teardown(target, volumes=volumes, confirm=True,
+                                    emit=writer.emit)
+        except errors.ReproError as exc:
+            jsonout.fail(exc)
+        jsonout.emit(jsonout.envelope(
+            "down", {"name": target, "volumes_removed": bool(volumes), **(result or {})}))
+        return
     target = _resolve_name(name)
     if volumes and not yes:
         # --volumes is irreversible (deletes the Mongo data + the record). Confirm.
@@ -378,7 +470,7 @@ def down(
         # confirm=True: the prompt above (or --yes) already gated it.
         lcsvc.teardown(target, volumes=volumes, confirm=True)
     except errors.ReproError as exc:
-        _err(str(exc))
+        _fail(exc)
     if volumes:
         ui.ok(f"✓ {target!r} removed (containers, data volume, and record).")
     else:
@@ -399,6 +491,14 @@ def monitor(
     """Attach (or --off to detach) Prometheus + Grafana on a running repro."""
     from rc_repro.services import monitor as monitorsvc
     target = _resolve_name(name)
+    # The monitoring stack is Prometheus + Grafana as compose services; there is no
+    # cluster rendering of it, so on a Kubernetes repro it would act on a compose
+    # project that does not exist. Refuse with the reason rather than no-op.
+    try:
+        lcsvc.require_compose_topology(target, "monitor",
+            "It attaches Prometheus/Grafana as compose services; there is no Kubernetes equivalent yet.")
+    except errors.ReproError as exc:
+        _fail(exc)
     try:
         if off:
             res = monitorsvc.detach(target, emit=_cli_emit)
@@ -411,7 +511,7 @@ def monitor(
             for line in res["notes"]:
                 ui.note(line)
     except errors.ReproError as exc:
-        _err(str(exc))
+        _fail(exc)
 
 
 @app.command()
@@ -422,7 +522,7 @@ def prune(
     try:
         targets = lcsvc.prunable()
     except errors.ReproError as exc:
-        _err(str(exc))
+        _fail(exc)
     if not targets:
         typer.echo("Nothing to prune.")
         return
@@ -434,7 +534,7 @@ def prune(
     try:
         res = lcsvc.prune(confirm=True, emit=_cli_emit)
     except errors.ReproError as exc:
-        _err(str(exc))
+        _fail(exc)
     if res["removed"]:
         ui.ok(f"✓ pruned {len(res['removed'])}: {', '.join(res['removed'])}")
     else:
@@ -459,7 +559,7 @@ def stop(name: str = typer.Option("", "--name", "-n")) -> None:
     try:
         lcsvc.set_state(target, "stop")
     except errors.ReproError as exc:
-        _err(str(exc))
+        _fail(exc)
     ui.ok(f"✓ {target!r} stopped (resume with `rc-repro start`).")
 
 
@@ -470,7 +570,7 @@ def restart(name: str = typer.Option("", "--name", "-n")) -> None:
     try:
         lcsvc.set_state(target, "restart")
     except errors.ReproError as exc:
-        _err(str(exc))
+        _fail(exc)
     ui.ok(f"✓ {target!r} restarted.")
 
 
@@ -486,9 +586,16 @@ def use(name: str = typer.Argument(..., help="repro to make the default")) -> No
 
 
 @app.command(name="list")
-def list_cmd() -> None:
+def list_cmd(
+    json_out: bool = typer.Option(False, "--json", help="emit the stable JSON record instead of a table"),
+) -> None:
     """List all repros with version, port, status and URL."""
     repros = lcsvc.list_repros()
+    if json_out:
+        # Empty is a valid answer, not an error: an agent asking "what exists"
+        # gets [] rather than having to special-case a prose line.
+        jsonout.emit(jsonout.envelope("list", {"repros": repros}))
+        return
     if not repros:
         typer.echo("No repros yet. Create one with `rc-repro up --version <X.Y.Z>`.")
         return
@@ -503,8 +610,20 @@ def list_cmd() -> None:
 
 
 @app.command()
-def info(name: str = typer.Option("", "--name", "-n")) -> None:
+def info(
+    name: str = typer.Option("", "--name", "-n"),
+    json_out: bool = typer.Option(False, "--json", help="emit the stable JSON record instead of a panel"),
+) -> None:
     """Show a repro's URL, admin credentials and a curl snippet."""
+    if json_out:
+        # Resolve inside the try so a missing repro is reported as an error
+        # envelope with its code, not as a bare traceback or a prose line.
+        try:
+            target = lcsvc.resolve_name(name)
+            jsonout.emit(jsonout.envelope("info", lcsvc.detail(target)))
+        except errors.ReproError as exc:
+            jsonout.fail(exc)
+        return
     target = _resolve_name(name)
     m = runner.read_meta(target)
     _summary_panel(m)
@@ -517,7 +636,11 @@ def info(name: str = typer.Option("", "--name", "-n")) -> None:
 def token(name: str = typer.Option("", "--name", "-n")) -> None:
     """Mint an API auth token (X-Auth-Token / X-User-Id headers)."""
     _require_docker()
-    m = runner.read_meta(_resolve_name(name))
+    _target = _resolve_name(name)
+    # Kubernetes reachability is a port-forward that may have died; revive it before
+    # talking HTTP, or this fails for a reason unrelated to what was asked.
+    lcsvc.ensure_reachable(_target)
+    m = runner.read_meta(_target)
     try:
         auth = _login(m)
     except Exception as exc:  # noqa: BLE001 - surface any auth/connection failure
@@ -542,7 +665,11 @@ def api(
       rc-repro api POST /api/v1/users.update --2fa -d '{"userId":"ID","data":{"name":"X"}}'
     """
     _require_docker()
-    m = runner.read_meta(_resolve_name(name))
+    _target = _resolve_name(name)
+    # Kubernetes reachability is a port-forward that may have died; revive it before
+    # talking HTTP, or this fails for a reason unrelated to what was asked.
+    lcsvc.ensure_reachable(_target)
+    m = runner.read_meta(_target)
     try:
         auth = _login(m)
         if pat:
@@ -582,7 +709,11 @@ def pat(
 ) -> None:
     """Mint a Personal Access Token and print ready-to-use headers (curl/Postman)."""
     _require_docker()
-    m = runner.read_meta(_resolve_name(name))
+    _target = _resolve_name(name)
+    # Kubernetes reachability is a port-forward that may have died; revive it before
+    # talking HTTP, or this fails for a reason unrelated to what was asked.
+    lcsvc.ensure_reachable(_target)
+    m = runner.read_meta(_target)
     try:
         auth = _login(m)
         token = rcapi.generate_pat(m.root_url, auth, config.ADMIN_PASSWORD, token_name=label, bypass_2fa=bypass_2fa)
@@ -614,7 +745,11 @@ def seed_cmd(
     default REST seed when you need real, loginable users.
     """
     _require_docker()
-    m = runner.read_meta(_resolve_name(name))
+    _target = _resolve_name(name)
+    # Kubernetes reachability is a port-forward that may have died; revive it before
+    # talking HTTP, or this fails for a reason unrelated to what was asked.
+    lcsvc.ensure_reachable(_target)
+    m = runner.read_meta(_target)
     if clear_scale:
         _clear_scale(m)
         return
@@ -644,12 +779,16 @@ def config_import(
     path = Path(settings_file)
     if not path.is_file():
         _err(f"no such file: {settings_file}")
-    m = runner.read_meta(_resolve_name(name))
+    _target = _resolve_name(name)
+    # Kubernetes reachability is a port-forward that may have died; revive it before
+    # talking HTTP, or this fails for a reason unrelated to what was asked.
+    lcsvc.ensure_reachable(_target)
+    m = runner.read_meta(_target)
     onlyset = {p.strip() for p in only.split(",")} if only else None
     try:
         plan = datasvc.import_plan(m.name, str(path), only=onlyset)
     except errors.ReproError as exc:
-        _err(str(exc))
+        _fail(exc)
 
     lines = [f"apply    {plan['counts']['apply']} customized setting(s)",
              f"skip     {plan['counts']['redacted']} redacted secret(s), "
@@ -669,7 +808,7 @@ def config_import(
     try:
         res = datasvc.import_apply(m.name, str(path), only=onlyset, emit=_cli_emit)
     except errors.ReproError as exc:
-        _err(str(exc))
+        _fail(exc)
     if res["failed"]:
         ui.warn(f"  {res['failed']} setting(s) rejected: {', '.join(res['failures'][:10])}"
                 + (" ..." if res["failed"] > 10 else ""))
@@ -686,7 +825,14 @@ def stats(
 ) -> None:
     """Sample a repro's container CPU/RAM (peak over a window, or --watch live)."""
     _require_docker()
-    m = runner.read_meta(_resolve_name(name))
+    _target = _resolve_name(name)
+    # Refuse rather than silently report nothing: a command that is
+    # accepted and then does nothing is the failure rc-repro exists to remove.
+    lcsvc.require_compose_topology(_target, 'stats', 'It reads container stats from the compose project; the Kubernetes equivalent needs metrics-server.')
+    # Kubernetes reachability is a port-forward that may have died; revive it before
+    # talking HTTP, or this fails for a reason unrelated to what was asked.
+    lcsvc.ensure_reachable(_target)
+    m = runner.read_meta(_target)
     if watch:
         typer.echo(f"Live stats for {m.name!r} (Ctrl-C to stop)…")
         try:
@@ -1071,7 +1217,14 @@ def loadtest(
         except ValueError as exc:
             _err(f"bad --slo: {exc}")
 
-    m = runner.read_meta(_resolve_name(name))
+    _target = _resolve_name(name)
+    # Refuse rather than silently report nothing: a command that is
+    # accepted and then does nothing is the failure rc-repro exists to remove.
+    lcsvc.require_compose_topology(_target, 'loadtest', 'It measures resource cost through the compose project, so results would be missing on Kubernetes.')
+    # Kubernetes reachability is a port-forward that may have died; revive it before
+    # talking HTTP, or this fails for a reason unrelated to what was asked.
+    lcsvc.ensure_reachable(_target)
+    m = runner.read_meta(_target)
     doc = runner.read_compose(m.name)
     target = _loadtest_target(doc)
     if live:
@@ -1355,7 +1508,14 @@ def capacity(
         except ValueError as exc:
             _err(f"bad --constrain: {exc}")
 
-    m = runner.read_meta(_resolve_name(name))
+    _target = _resolve_name(name)
+    # Refuse rather than silently report nothing: a command that is
+    # accepted and then does nothing is the failure rc-repro exists to remove.
+    lcsvc.require_compose_topology(_target, 'capacity', 'It measures resource cost through the compose project, so results would be missing on Kubernetes.')
+    # Kubernetes reachability is a port-forward that may have died; revive it before
+    # talking HTTP, or this fails for a reason unrelated to what was asked.
+    lcsvc.ensure_reachable(_target)
+    m = runner.read_meta(_target)
     doc = runner.read_compose(m.name)
     target = _loadtest_target(doc)
     rc_services = _rc_services_in(doc) or ["rocketchat"]
@@ -1523,6 +1683,9 @@ def logs(
     """Tail a repro's logs."""
     _require_docker()
     target = _resolve_name(name)
+    if lcsvc.topology_of_repro(target) == "kubernetes":
+        from rc_repro.services import k8s as k8ssvc
+        raise typer.Exit(k8ssvc.logs(target, follow=follow, tail=tail or None))
     runner.logs(target, follow=follow, tail=tail or None)
 
 
@@ -1546,6 +1709,151 @@ def presets_cmd() -> None:
         ui.box(title, lines, inner)
         typer.echo("")
     ui.hint("run: rc-repro up --version <X.Y.Z> --preset <name> [--set key=value]")
+
+
+@app.command()
+def onboard(
+    accept_defaults: bool = typer.Option(False, "--accept-defaults",
+                                         help="take every default without prompting (for scripts/CI)"),
+    grant: list[str] = typer.Option(None, "--grant",
+                                    help="authority to hand over, repeatable (see --help)"),
+    retain_runs: bool = typer.Option(False, "--retain-runs",
+                                     help="keep repros after evidence capture instead of tearing down"),
+    json_out: bool = typer.Option(False, "--json", help="emit the resulting state as JSON"),
+) -> None:
+    """Answer rc-repro's setup questions once. Later runs never re-ask them.
+
+    Interactive without flags; fully non-interactive with --accept-defaults, so a
+    human can authorise a machine in one command and an agent then runs silently.
+    """
+    grants = list(grant or [])
+    prefs: dict = {}
+    if not accept_defaults and not json_out:
+        # Interactive: a thin collector calling the same writer the flags call, so
+        # the two front doors cannot drift.
+        typer.echo("rc-repro setup — asked once, then never again.\n")
+        if "engine-resize" not in grants:
+            typer.echo("Some presets need more memory than your container engine has.")
+            ui.warn("  Resizing restarts the engine, which stops unrelated containers.")
+            if typer.confirm("May rc-repro stop, resize, and restart it when needed?",
+                             default=False):
+                grants.append("engine-resize")
+        prefs["retain_runs"] = typer.confirm(
+            "Keep repros after capturing evidence (instead of tearing them down)?",
+            default=False)
+    else:
+        prefs["retain_runs"] = retain_runs
+
+    try:
+        result = onboardsvc.complete(grants=grants, preferences=prefs)
+    except errors.ReproError as exc:
+        jsonout.fail(exc) if json_out else _fail(exc)
+
+    if json_out:
+        jsonout.emit(jsonout.envelope("onboard", result))
+        return
+    ui.ok("✓ onboarding recorded")
+    for name in sorted(onboardsvc.GRANTS):
+        key = name.replace("-", "_")
+        mark = "granted" if result["grants"].get(key) else "not granted"
+        typer.echo(f"  {name}: {mark}")
+    typer.echo(f"  retain runs: {result['preferences']['retain_runs']}")
+    ui.hint("  change any answer by running `rc-repro onboard` again")
+
+
+skill_app = typer.Typer(help="Install the rc-repro agent skill into an agent host.")
+app.add_typer(skill_app, name="skill")
+
+
+@skill_app.command("install")
+def skill_install(
+    host: str = typer.Option("all", "--host", help="claude | codex | all"),
+    scope: str = typer.Option("user", "--scope", help="user | project"),
+    force: bool = typer.Option(False, "--force", help="overwrite a locally edited skill"),
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    """Install the skill that shipped with this rc-repro.
+
+    The bundle lives inside the package, so the installed skill always describes
+    the rc-repro you are actually running. Idempotent: re-run it to repair drift.
+    """
+    try:
+        results = (skillsvc.install_all(scope, force=force) if host == "all"
+                   else [skillsvc.install(host, scope, force=force)])
+    except errors.ReproError as exc:
+        jsonout.fail(exc) if json_out else _fail(exc)
+    payload = [{"host": r.host, "scope": r.scope, "path": str(r.path),
+                "state": r.state, "version": r.installed_version} for r in results]
+    if json_out:
+        jsonout.emit(jsonout.envelope("skill-install", {"installed": payload}))
+        return
+    for r in payload:
+        ui.ok(f"✓ {r['host']}: {r['path']}")
+    # Cursor and Copilot read these same directories, so they need no separate copy.
+    ui.hint("  cursor and copilot read these directories too — nothing more to do")
+
+
+@skill_app.command("status")
+def skill_status(
+    scope: str = typer.Option("user", "--scope", help="user | project"),
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    """Report whether each host's installed skill matches this rc-repro."""
+    rows = []
+    for h in sorted(skillsvc.HOSTS):
+        st = skillsvc.status(h, scope)
+        rows.append({"host": h, "scope": st.scope, "path": str(st.path),
+                     "state": st.state, "installed_version": st.installed_version})
+    if json_out:
+        jsonout.emit(jsonout.envelope(
+            "skill-status", {"bundled_version": skillsvc.__version__, "installs": rows}))
+        return
+    for r in rows:
+        line = f"  {r['host']:8} {r['state']:9} {r['path']}"
+        (ui.ok if r["state"] == "current" else ui.warn)(line)
+    if any(r["state"] != "current" for r in rows):
+        ui.hint("  repair with: rc-repro skill install")
+
+
+@app.command()
+def evidence(
+    name: str = typer.Option("", "--name", "-n"),
+    bundle: str = typer.Option("", "--bundle", help="also write logs and the rendered artifact to this directory"),
+    json_out: bool = typer.Option(True, "--json/--no-json", help="the record is JSON; --no-json prints a summary"),
+) -> None:
+    """Emit a secret-safe record of what was deployed and how it is behaving.
+
+    Safe to attach to a support case: the root URL is reduced to its origin and no
+    token, licence, or password appears anywhere.
+    """
+    try:
+        payload = evidencesvc.record(name)
+        if bundle:
+            payload["bundle"] = evidencesvc.write_bundle(payload["repro"]["name"],
+                                                         bundle, payload)
+    except errors.ReproError as exc:
+        jsonout.fail(exc) if json_out else _fail(exc)
+    if json_out:
+        jsonout.emit(jsonout.envelope("evidence", payload))
+        return
+    r = payload["repro"]
+    typer.echo(f"{r['name']}  {r['rc_version']}  {r['topology']}  {payload['runtime']['state']}")
+    typer.echo(f"  artifact  {payload['artifact']['name']} sha256:{payload['artifact']['sha256'][:12]}")
+    typer.echo(f"  licensed  required={payload['license']['required']} supplied={payload['license']['supplied']}")
+    typer.echo(f"  cleanup   {payload['retention']['cleanup']}")
+
+
+@app.command()
+def capabilities() -> None:
+    """Report what this rc-repro build can do, for scripts and agent skills.
+
+    No --json flag: the record is JSON by definition, and a flag that is accepted
+    and then ignored is worse than no flag.
+
+    Answers offline and without a container engine on purpose: a caller asks this
+    before it knows whether the environment works. Engine checks live in `doctor`.
+    """
+    jsonout.emit(jsonout.envelope("capabilities", jsonout.capabilities(app)))
 
 
 @app.command(name="versions")
@@ -1574,28 +1882,43 @@ def _kernel_major_minor(kv: str | None) -> tuple[int, int] | None:
 
 
 @app.command()
-def doctor() -> None:
-    """Preflight: check Docker, Compose, disk, connectivity and ports."""
-    import shutil
+def doctor(
+    json_out: bool = typer.Option(False, "--json", help="emit the stable preflight record instead of a report"),
+) -> None:
+    """Preflight: check Docker, Compose, disk, connectivity and ports.
 
+    This is the call an agent makes before committing to a create, so `--json`
+    returns the same envelope every other verb uses, with one entry per check
+    carrying a stable id and ok|warn|fail, and exits 3 (preflight) on any fail so
+    the agent stops before attempting `up`.
+    """
     counts = {"ok": 0, "warn": 0, "fail": 0}
     marks = {
         "ok": ("✓", typer.colors.GREEN),
         "warn": ("⚠", typer.colors.YELLOW),
         "fail": ("✗", typer.colors.RED),
     }
+    checks: list[dict] = []
 
-    def line(status: str, msg: str) -> None:
+    def line(status: str, msg: str, check: str = "") -> None:
         counts[status] += 1
+        # A stable id per check so an agent branches on the id, not the prose. If a
+        # call site gives none, derive a slug from the message's first words — good
+        # enough to be stable across reworded tails, and every load-bearing check
+        # passes one explicitly below.
+        cid = check or "-".join(re.findall(r"[a-z0-9]+", msg.lower())[:3])
+        checks.append({"check": cid, "status": status, "message": msg})
+        if json_out:
+            return
         sym, color = marks[status]
         typer.secho(f"{sym} {msg}", fg=color)
 
     # Docker daemon (everything else that needs Docker degrades gracefully).
     docker_up = runner.docker_available()
     if docker_up:
-        line("ok", f"Docker daemon running ({runner.docker_server_version() or '?'})")
+        line("ok", f"Docker daemon running ({runner.docker_server_version() or '?'})", "docker-daemon")
     else:
-        line("fail", "Docker daemon not running — start Docker Desktop / dockerd")
+        line("fail", "Docker daemon not running — start Docker Desktop / dockerd", "docker-daemon")
 
     # docker compose v2
     cv = runner.compose_version()
@@ -1614,7 +1937,8 @@ def doctor() -> None:
         mm = _kernel_major_minor(kv) if kv else None
         if mm and mm >= (6, 19):
             line("warn", f"engine kernel {kv} — MongoDB 8.0 will not start (SERVER-121912); "
-                         "use an engine on kernel < 6.19 for RC versions that require Mongo 8")
+                         "use an engine on kernel < 6.19 for RC versions that require Mongo 8",
+                 "kernel-mongo8")
         elif kv:
             line("ok", f"engine kernel {kv}")
 
@@ -1664,10 +1988,47 @@ def doctor() -> None:
         running = sum(1 for m in metas if _pretty_state(states.get(m.project, "")) == "running")
         typer.echo(f"  repros: {len(metas)} total, {running} running")
 
+    # Kubernetes topology readiness. Reported rather than required: the Kubernetes
+    # preset is opt-in, so a missing toolchain is a warning for the Docker user and
+    # only becomes an error when `up --preset microservices` actually asks for it.
+    from rc_repro.services import k8s as _k8s
+    k8s_tools = {t: shutil.which(t) for t in ("kind", "kubectl", "helm")}
+    missing_k8s = [t for t, path in k8s_tools.items() if not path]
+    if missing_k8s:
+        line("warn", "Kubernetes presets need " + ", ".join(missing_k8s) +
+                     " on PATH (not needed for Docker presets)", "k8s-tools")
+    else:
+        line("ok", "kind, kubectl and helm present (Kubernetes presets available)", "k8s-tools")
+        mem_gib, cpus = _k8s.engine_capacity()
+        if mem_gib or cpus:
+            floor_ok = mem_gib >= _k8s.FLOOR_MEMORY_GIB and cpus >= _k8s.FLOOR_CPUS
+            msg = (f"engine has {mem_gib:.1f} GiB and {cpus} CPUs; the microservices "
+                   f"preset needs {_k8s.FLOOR_MEMORY_GIB:g} GiB and {_k8s.FLOOR_CPUS}")
+            # CPU is the binding constraint during start-up, so it is named too: a
+            # memory-only report would look fine on a host that then crawls.
+            line("ok" if floor_ok else "warn", msg, "k8s-floor")
+        if _k8s.cluster_exists():
+            line("ok", f"rc-repro cluster {_k8s.CLUSTER_NAME} exists (reused, so `up` is faster)")
+        stale = lcsvc.stale_forwards()
+        if stale:
+            names = ", ".join(r["name"] for r in stale)
+            line("warn", f"port-forward down for: {names} "
+                         "(re-established on the next ready/info; not an error)", "k8s-forwards")
+
+    if json_out:
+        payload = {"checks": checks, "counts": counts,
+                   "ready": counts["fail"] == 0}
+        jsonout.emit(jsonout.envelope("doctor", payload))
+        # Exit 3 (preflight) on any fail, so an agent stops before `up`. A warn is
+        # usable, so it does not change the exit code.
+        if counts["fail"]:
+            raise typer.Exit(errors.DockerError.exit_code)
+        return
+
     typer.echo("")
     if counts["fail"]:
         typer.secho("Not ready — fix the ✗ item(s) above.", fg=typer.colors.RED)
-        raise typer.Exit(1)
+        raise typer.Exit(errors.DockerError.exit_code)
     if counts["warn"]:
         typer.secho("Usable, with warnings above.", fg=typer.colors.YELLOW)
     else:
