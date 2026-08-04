@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from rc_repro import config, jsonout
 from rc_repro.cli import app
 from rc_repro.services import onboarding
@@ -75,6 +77,47 @@ def test_partial_patch_preserves_untouched_settings(tmp_path, monkeypatch):
     assert "SUPERSECRET" not in json.dumps(second)
 
 
+def test_invalid_and_empty_patches_never_mutate_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+
+    with pytest.raises(onboarding.ValidationError, match="unknown deployment"):
+        onboarding.apply_setup_patch({"deployment": "not-a-deployment"})
+    assert config.load_config(with_env=False) == {}
+    assert onboarding.state()["completed"] is False
+
+    onboarding.apply_setup_patch({})
+    assert config.load_config(with_env=False) == {}
+    assert onboarding.state()["completed"] is False
+
+
+def test_deployment_change_clears_only_an_incompatible_saved_scenario(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    onboarding.apply_setup_patch({"deployment": "default", "scenarios": ["ldap"]})
+
+    snap = onboarding.apply_setup_patch({"deployment": "multi-instance"})
+
+    assert snap["selection"]["deployment"] == "multi-instance"
+    assert snap["selection"]["scenarios"] == []
+    assert "--scenario" not in snap["first_run_command"]
+    assert config.load_config(with_env=False)["default_scenarios"] == []
+
+
+def test_explicit_incompatible_selector_pair_is_rejected_before_any_write(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    onboarding.apply_setup_patch({"deployment": "default", "scenarios": ["ldap"]})
+    before = config.load_config(with_env=False)
+
+    with pytest.raises(onboarding.ValidationError):
+        onboarding.apply_setup_patch({
+            "deployment": "multi-instance", "scenarios": ["ldap"],
+            "seed_profile": "large",
+        })
+
+    assert config.load_config(with_env=False) == before
+
+
 def test_compose_patch_never_requires_kubernetes_grants(tmp_path, monkeypatch):
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
     snap = onboarding.apply_setup_patch({
@@ -116,6 +159,44 @@ def test_kubernetes_snapshot_exposes_capacity_and_authority(tmp_path, monkeypatc
     assert snap["capacity"]["observed_memory_gib"] == 2.0
     assert snap["capacity"]["required_memory_gib"] == 6.0
     assert snap["capacity"]["supported_action"] == "manual_memory"
+
+
+def test_unlicensed_kubernetes_first_run_defers_seed_without_exposing_token(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    env = _compose_env(
+        tools={"docker": "ok", "compose": "ok", "kind": "ok",
+               "kubectl": "ok", "helm": "ok"},
+        engine_provider="docker-compatible",
+        engine_memory_gib=15.0, engine_cpus=4,
+        missing_kubernetes_tools=[], microservices_ready=True,
+    )
+    draft = {
+        "deployment": "microservices",
+        "scenarios": ["ldap"],
+        "seed_profile": "small",
+        "grants": {"owned-cluster": True},
+    }
+
+    unlicensed = onboarding.setup_snapshot(
+        cfg={}, environment=env, draft=draft)
+    assert unlicensed["license"] == {
+        "required": True,
+        "supplied": False,
+        "status": "required",
+        "code": "LICENSE_ABSENT_EE_PRESET",
+        "seed_deferred": True,
+        "remediation": unlicensed["license"]["remediation"],
+    }
+    assert unlicensed["review"]["seed_status"] == "deferred_license_required"
+    assert "--seed" not in unlicensed["first_run_command"]
+
+    licensed = onboarding.setup_snapshot(
+        cfg={"reg_token": "SUPERSECRET"}, environment=env, draft=draft)
+    assert licensed["license"]["supplied"] is True
+    assert licensed["license"]["seed_deferred"] is False
+    assert "--seed --seed-profile small" in licensed["first_run_command"]
+    assert "SUPERSECRET" not in json.dumps(licensed)
 
 
 def test_podman_memory_shortfall_offers_resize_grant(tmp_path, monkeypatch):

@@ -287,6 +287,21 @@ def _host_memory_gib() -> float:
         return 0.0
 
 
+def classify_engine_provider(platform_name: str | None,
+                             endpoint: str | None = None) -> str:
+    """Classify the active Docker-compatible server from product and endpoint facts."""
+    lower = (platform_name or "").strip().lower()
+    endpoint_lower = (endpoint or "").strip().lower()
+    if "podman" in lower or "podman.sock" in endpoint_lower or "/podman/" in endpoint_lower:
+        return "podman"
+    if not lower:
+        return "docker-compatible"
+    if "docker" in lower or "moby" in lower:
+        return "docker"
+    # Colima, Rancher Desktop, etc. remain docker-compatible, never podman.
+    return "docker-compatible"
+
+
 def detect_engine_provider() -> str:
     """Classify the active container endpoint without guessing Podman from Docker.
 
@@ -297,16 +312,8 @@ def detect_engine_provider() -> str:
 
     if not runner.docker_available():
         return "unavailable"
-    platform_name = (runner.docker_server_platform() or "").strip()
-    lower = platform_name.lower()
-    if "podman" in lower:
-        return "podman"
-    if not platform_name:
-        return "docker-compatible"
-    if "docker" in lower or "moby" in lower:
-        return "docker"
-    # Colima, Rancher Desktop, etc. remain docker-compatible, never podman.
-    return "docker-compatible"
+    return classify_engine_provider(
+        runner.docker_server_platform(), runner.docker_endpoint())
 
 
 def detect_environment() -> dict:
@@ -425,13 +432,39 @@ def _deployment_choices() -> list[dict[str, str]]:
             for name in presets.deployment_names()]
 
 
+def _validated_selection(deployment: str,
+                         scenarios: Iterable[str] | None) -> tuple[str, tuple[str, ...]]:
+    """Normalize and validate selectors before they can be persisted or rendered."""
+    from rc_repro import presets
+
+    dep = presets._normalise_deployment(deployment) or "default"
+    if dep not in presets.DEPLOYMENT_PRESETS:
+        valid = ", ".join(presets.deployment_names())
+        raise ValidationError(f"unknown deployment {deployment!r}; valid: {valid}")
+    selected = presets._normalise_scenarios(scenarios)
+    if len(selected) > 1:
+        requested = ", ".join(selected)
+        raise ValidationError(
+            f"scenario set [{requested}] is not supported yet; use zero or one scenario")
+    matrix = presets.compatibility_matrix()
+    unsupported = [scenario for scenario in selected
+                   if scenario not in matrix.get(dep, ())]
+    if unsupported:
+        supported = ", ".join(matrix.get(dep, ())) or "none"
+        raise ValidationError(
+            f"deployment {dep!r} does not support scenario {unsupported[0]!r}; "
+            f"supported: {supported}")
+    return dep, selected
+
+
 def build_first_run_command(*, deployment: str = "default",
                             scenarios: Iterable[str] | None = None,
                             seed_profile: str = "small",
                             version: str = DEFAULT_FIRST_RUN_VERSION,
-                            microservices_ready: bool = False) -> str:
+                            microservices_ready: bool = False,
+                            seed_allowed: bool = True) -> str:
     """One exact, runnable next command reflecting the applied setup choices."""
-    scenarios = tuple(scenarios or ())
+    deployment, scenarios = _validated_selection(deployment, scenarios)
     if deployment == "microservices" and not scenarios and microservices_ready:
         # Preserve the documented classic first-run form for the ready path.
         cmd = FIRST_RUN_COMMAND
@@ -448,7 +481,7 @@ def build_first_run_command(*, deployment: str = "default",
             if "--deployment" not in parts:
                 parts.extend(["--deployment", "microservices"])
         cmd = " ".join(parts)
-    if seed_profile and seed_profile != "none":
+    if seed_allowed and seed_profile and seed_profile != "none":
         if "--seed" not in cmd:
             cmd = f"{cmd} --seed --seed-profile {seed_profile}"
     return cmd
@@ -669,8 +702,11 @@ def _merge_draft(persisted: Mapping, draft: Mapping | None) -> dict[str, Any]:
     }
     if not draft:
         return out
+    deployment_changed = False
     if "deployment" in draft and draft["deployment"] is not None:
-        out["deployment"] = str(draft["deployment"]).strip().lower() or "default"
+        selected, _ = _validated_selection(str(draft["deployment"]), ())
+        deployment_changed = selected != out["deployment"]
+        out["deployment"] = selected
         out["answered_deployment"] = True
     if "scenarios" in draft and draft["scenarios"] is not None:
         if isinstance(draft["scenarios"], str):
@@ -679,6 +715,14 @@ def _merge_draft(persisted: Mapping, draft: Mapping | None) -> dict[str, Any]:
         else:
             out["scenarios"] = [str(s).strip() for s in draft["scenarios"] if str(s).strip()]
         out["answered_scenarios"] = True
+    elif deployment_changed:
+        # A saved scenario is a dependent selector. Reconfiguration must not carry
+        # it into a deployment where it cannot run or render an invalid command.
+        try:
+            _validated_selection(out["deployment"], out["scenarios"])
+        except ValidationError:
+            out["scenarios"] = []
+            out["answered_scenarios"] = False
     if "seed_profile" in draft and draft["seed_profile"] is not None:
         out["seed_profile"] = str(draft["seed_profile"]).strip().lower()
         out["answered_preferences"] = {
@@ -741,6 +785,39 @@ def setup_snapshot(cfg: dict | None = None, *,
     deployment = view["deployment"]
     topology = _topology_for(deployment)
     is_kubernetes = topology == "kubernetes"
+
+    # A scenario adapter may change services and settings, but deployment-level
+    # requirements still apply.  Resolve the actual aggregate and expose only a
+    # boolean presence check for the registration token: the value remains
+    # secret and never enters the setup snapshot.
+    from rc_repro import presets
+    resolved = presets.resolve_selection(
+        deployment=deployment, scenarios=view["scenarios"], saved={})
+    license_required = bool(resolved.preset.requires_license)
+    license_supplied = bool(str(cfg.get("reg_token") or "").strip())
+    seed_requested = bool(view["seed_profile"] and view["seed_profile"] != "none")
+    seed_deferred = bool(
+        license_required and not license_supplied and seed_requested)
+    license_info = {
+        "required": license_required,
+        "supplied": license_supplied,
+        "status": (
+            "supplied" if license_required and license_supplied
+            else "required" if license_required
+            else "not_required"
+        ),
+        "code": (
+            "LICENSE_ABSENT_EE_PRESET"
+            if license_required and not license_supplied else ""
+        ),
+        "seed_deferred": seed_deferred,
+        "remediation": (
+            "Supply an Enterprise registration token with --reg-token, "
+            "RC_REPRO_REG_TOKEN, or the existing reg_token configuration before "
+            "requesting seed data."
+            if seed_deferred else ""
+        ),
+    }
 
     env: dict[str, Any]
     if environment is not None:
@@ -898,6 +975,7 @@ def setup_snapshot(cfg: dict | None = None, *,
         microservices_ready=bool(
             is_kubernetes and env.get("microservices_ready") and
             view["grants"].get("owned_cluster") and capacity.get("ready")),
+        seed_allowed=not seed_deferred,
     )
 
     review = {
@@ -905,7 +983,11 @@ def setup_snapshot(cfg: dict | None = None, *,
         "topology": topology,
         "scenarios": list(view["scenarios"]),
         "seed_profile": view["seed_profile"],
+        "seed_status": (
+            "deferred_license_required" if seed_deferred else "ready"
+        ),
         "retain_runs": bool(view["retain_runs"]),
+        "license": dict(license_info),
         "grants": {
             "owned_cluster": bool(view["grants"].get("owned_cluster")),
             "engine_resize": bool(view["grants"].get("engine_resize")),
@@ -961,6 +1043,7 @@ def setup_snapshot(cfg: dict | None = None, *,
         },
         "environment": env,
         "capacity": capacity,
+        "license": license_info,
         "questions": applicable_questions,
         "hidden_questions": hidden_questions,
         "gates": gates,
@@ -985,6 +1068,7 @@ def apply_setup_patch(patch: Mapping[str, Any] | None = None, *,
     from rc_repro import presets
 
     patch = dict(patch or {})
+    cfg_before = config.load_config(with_env=False)
     grants_in = patch.get("grants")
     granted: list[str] = []
     denied: list[str] = []
@@ -1000,6 +1084,10 @@ def apply_setup_patch(patch: Mapping[str, Any] | None = None, *,
         granted.append(_normalise_grant_name(str(name)))
     for name in patch.get("deny") or patch.get("denied_grants") or []:
         denied.append(_normalise_grant_name(str(name)))
+    overlap = sorted(set(granted) & set(denied))
+    if overlap:
+        raise ValidationError(
+            f"grant(s) cannot be both granted and denied: {', '.join(overlap)}")
 
     prefs: dict[str, object] = {}
     if "retain_runs" in patch and patch["retain_runs"] is not None:
@@ -1014,10 +1102,39 @@ def apply_setup_patch(patch: Mapping[str, Any] | None = None, *,
                 f"available: {', '.join(SEED_PROFILE_CHOICES)}")
         prefs["seed_profile"] = profile
 
+    # Resolve and validate the entire selector pair before the first config write.
+    # A deployment-only change may clear an old scenario that is no longer valid;
+    # an explicitly supplied incompatible pair is rejected.
+    saved_deployment, saved_scenarios = presets._saved_selectors(cfg_before)
+    selected_deployment = saved_deployment or "default"
+    selected_scenarios = tuple(saved_scenarios)
+    deployment_supplied = "deployment" in patch and patch["deployment"] is not None
+    scenarios_supplied = "scenarios" in patch and patch["scenarios"] is not None
+    if deployment_supplied:
+        selected_deployment, _ = _validated_selection(str(patch["deployment"]), ())
+    if scenarios_supplied:
+        raw_scenarios = patch["scenarios"]
+        if isinstance(raw_scenarios, str):
+            raw_scenarios = raw_scenarios.split(",")
+        selected_deployment, selected_scenarios = _validated_selection(
+            selected_deployment, raw_scenarios)
+    elif deployment_supplied:
+        try:
+            _, selected_scenarios = _validated_selection(
+                selected_deployment, selected_scenarios)
+        except ValidationError:
+            selected_scenarios = ()
+
     # Prefer complete() for grant/preference writes so both front doors share one
     # writer. When the patch only touches selectors, still mark complete if asked.
-    needs_complete = bool(granted or denied or prefs or mark_complete or
-                          "clusters" in patch)
+    mutation_keys = {
+        "grants", "grant", "grants_granted", "deny", "denied_grants",
+        "retain_runs", "kubernetes_target", "seed_profile", "clusters",
+        "deployment", "scenarios",
+    }
+    has_mutation = bool(mutation_keys.intersection(patch))
+    needs_complete = bool(granted or denied or prefs or
+                          (mark_complete and has_mutation) or "clusters" in patch)
     if needs_complete:
         complete(
             grants=granted or None,
@@ -1027,33 +1144,13 @@ def apply_setup_patch(patch: Mapping[str, Any] | None = None, *,
         )
 
     # Selector defaults: only overwrite keys present in the patch.
-    if "deployment" in patch or "scenarios" in patch:
+    if deployment_supplied or scenarios_supplied:
         cfg = config.load_config(with_env=False)
-        if "deployment" in patch and patch["deployment"] is not None:
-            dep = str(patch["deployment"]).strip().lower()
-            dep = presets._normalise_deployment(dep) or dep
-            if dep not in presets.DEPLOYMENT_PRESETS:
-                valid = ", ".join(presets.deployment_names())
-                raise ValidationError(
-                    f"unknown deployment {patch['deployment']!r}; "
-                    f"valid: {valid}")
-            cfg["default_deployment"] = dep
-        if "scenarios" in patch and patch["scenarios"] is not None:
-            if isinstance(patch["scenarios"], str):
-                raw_scenarios: Iterable[str] = patch["scenarios"].split(",")
-            else:
-                raw_scenarios = patch["scenarios"]  # type: ignore[assignment]
-            scenarios = presets._normalise_scenarios(list(raw_scenarios))
-            deployment = presets._normalise_deployment(
-                str(cfg.get("default_deployment") or "default")) or "default"
-            matrix = presets.compatibility_matrix()
-            for scenario in scenarios:
-                if scenario not in matrix.get(deployment, ()):
-                    supported = ", ".join(matrix.get(deployment, ())) or "none"
-                    raise ValidationError(
-                        f"deployment {deployment!r} does not support scenario "
-                        f"{scenario!r}; supported: {supported}")
-            cfg["default_scenarios"] = list(scenarios)
+        if deployment_supplied:
+            cfg["default_deployment"] = selected_deployment
+        if scenarios_supplied or (deployment_supplied and
+                                  tuple(saved_scenarios) != selected_scenarios):
+            cfg["default_scenarios"] = list(selected_scenarios)
         config.save_config(cfg)
         # Ensure onboarding completed marker exists after selector-only patches.
         if mark_complete and not state()["completed"]:
@@ -1061,4 +1158,3 @@ def apply_setup_patch(patch: Mapping[str, Any] | None = None, *,
 
     # probe_environment=True so the returned snapshot rediscovers transient facts.
     return setup_snapshot(probe_environment=True)
-

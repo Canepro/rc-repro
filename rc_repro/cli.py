@@ -2227,8 +2227,10 @@ def onboard(
     snap = onboardsvc.setup_snapshot(environment=environment, section=section)
 
     # Returning user with nothing to do: settle silently unless reconfigure/section.
-    if (current["completed"] and not reconfigure and not section and interactive
-            and not structured):
+    has_unanswered_applicable = any(
+        not question.get("answered", False) for question in snap["questions"])
+    if (current["completed"] and not has_unanswered_applicable and
+            not reconfigure and not section and interactive and not structured):
         typer.echo("Settled choices are unchanged; use --reconfigure or "
                    "--section <name> to change them.")
         ui.hint(f"  first run: {snap['first_run_command']}")
@@ -2373,6 +2375,9 @@ def onboard(
         typer.echo(f"  deployment: {live['review']['deployment']}")
         typer.echo(f"  scenarios: {', '.join(live['review']['scenarios']) or '(none)'}")
         typer.echo(f"  seed: {live['review']['seed_profile']}")
+        if live["license"].get("seed_deferred"):
+            ui.warn("  seed is deferred until an Enterprise registration token "
+                    "is supplied")
         typer.echo(f"  retain runs: {live['review']['retain_runs']}")
         if live["selection"]["topology"] == "kubernetes":
             typer.echo(f"  owned-cluster: {live['review']['grants']['owned_cluster']}")
@@ -2405,7 +2410,12 @@ def onboard(
         # Deny unanswered grants only when accepting defaults on a fresh machine,
         # or when the selected deployment needs an explicit grant list.
         grants_map = dict(patch.get("grants") or {})
-        for name in onboardsvc.GRANTS:
+        preview = onboardsvc.setup_snapshot(environment=environment, draft=patch)
+        applicable_grants = {
+            question["grant"] for question in preview["questions"]
+            if question.get("grant")
+        }
+        for name in applicable_grants:
             key = onboardsvc.grant_key(name)
             if key in grants_map or name in grants_map:
                 continue
@@ -2440,6 +2450,8 @@ def onboard(
     typer.echo(f"  deployment: {result_snap['selection']['deployment']}")
     typer.echo(f"  scenarios: {', '.join(result_snap['selection']['scenarios']) or '(none)'}")
     typer.echo(f"  seed: {result_snap['selection']['seed_profile']}")
+    if result_snap["license"].get("seed_deferred"):
+        ui.warn("  seed is deferred until an Enterprise registration token is supplied")
     for name in sorted(onboardsvc.GRANTS):
         key = onboardsvc.grant_key(name)
         mark = "granted" if state["grants"].get(key) else "not granted"

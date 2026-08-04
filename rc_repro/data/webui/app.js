@@ -1386,8 +1386,10 @@ async function openSetup(force) {
   try {
     SETUP.snap = await api("/api/setup");
   } catch (e) { toast(formatApiError(e)); return; }
-  // Returning users with completed setup go straight to create unless forced.
-  if (SETUP.snap.completed && !force) {
+  // A completed marker does not settle questions introduced later or made
+  // applicable by a deployment change.
+  const hasUnanswered = (SETUP.snap.questions || []).some((q) => !q.answered);
+  if (SETUP.snap.completed && !hasUnanswered && !force) {
     openCreate();
     return;
   }
@@ -1396,11 +1398,11 @@ async function openSetup(force) {
     scenarios: (SETUP.snap.selection.scenarios || []).slice(),
     seed_profile: SETUP.snap.selection.seed_profile,
     retain_runs: SETUP.snap.selection.retain_runs,
-    grants: {
-      "owned-cluster": !!(SETUP.snap.persisted.grants && SETUP.snap.persisted.grants.owned_cluster),
-      "engine-resize": !!(SETUP.snap.persisted.grants && SETUP.snap.persisted.grants.engine_resize),
-    },
+    grants: {},
   };
+  for (const q of (SETUP.snap.questions || [])) {
+    if (q.grant) SETUP.draft.grants[q.grant] = !!q.value;
+  }
   SETUP.steps = setupStepIds(SETUP.snap);
   SETUP.index = 0;
   $("#setup-error").hidden = true;
@@ -1433,6 +1435,14 @@ function renderSetupStep() {
       el("p", {}, `Deployment: ${r.deployment || "?"}`),
       el("p", {}, `Scenarios: ${(r.scenarios || []).join(", ") || "(none)"}`),
       el("p", {}, `Seed: ${r.seed_profile || "?"}`),
+      ...(r.license && r.license.required ? [
+        el("p", { class: r.license.supplied ? "hint" : "hint bad" },
+          `Enterprise license: ${r.license.supplied ? "supplied" : "required"}`),
+        ...(r.license.seed_deferred ? [
+          el("p", { class: "hint bad" },
+            "Seed is deferred until a registration token is supplied."),
+        ] : []),
+      ] : []),
       el("p", {}, `Retain runs: ${r.retain_runs ? "yes" : "no"}`),
       el("p", {}, `First run: ${r.first_run_command || SETUP.snap.first_run_command || ""}`)));
     const gates = SETUP.snap.gates || [];
@@ -1510,6 +1520,7 @@ function collectSetupStep() {
     } else if (qid === "scenarios") {
       SETUP.draft.scenarios = input.value ? [input.value] : [];
     } else if (qid === "deployment") {
+      if (SETUP.draft.deployment !== input.value) SETUP.draft.scenarios = [];
       SETUP.draft.deployment = input.value;
     } else if (qid === "seed_profile") {
       SETUP.draft.seed_profile = input.value;

@@ -1989,6 +1989,8 @@ def test_environment_detection_routes_docker_commands_through_runner(tmp_path, m
     monkeypatch.setattr(runner, "docker_cli_version", lambda: "Docker version 29.6.1")
     monkeypatch.setattr(runner, "compose_version_line", lambda: "Docker Compose version v5.3.1")
     monkeypatch.setattr(runner, "docker_available", lambda: True)
+    monkeypatch.setattr(runner, "docker_server_platform", lambda: "Docker Engine - Community")
+    monkeypatch.setattr(runner, "docker_endpoint", lambda: "unix:///var/run/docker.sock")
     monkeypatch.setattr(k8s, "engine_capacity", lambda: (15.6, 4))
     monkeypatch.setattr(k8s, "engine_resize_supported", lambda: False)
 
@@ -1996,6 +1998,29 @@ def test_environment_detection_routes_docker_commands_through_runner(tmp_path, m
 
     assert detected["tools"]["docker"] == "Docker version 29.6.1"
     assert detected["tools"]["compose"] == "Docker Compose version v5.3.1"
+    assert detected["engine_provider"] == "docker"
+
+
+def test_environment_detection_recognises_active_podman_socket(tmp_path, monkeypatch):
+    from rc_repro import runner
+    from rc_repro.services import k8s, onboarding
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(onboarding.shutil, "which", lambda tool: f"/usr/bin/{tool}")
+    monkeypatch.setattr(onboarding, "_version_line", lambda tool, *args: f"{tool} ok")
+    monkeypatch.setattr(runner, "docker_cli_version", lambda: "Docker version 29.6.1")
+    monkeypatch.setattr(runner, "compose_version_line", lambda: "Docker Compose version v5.3.1")
+    monkeypatch.setattr(runner, "docker_available", lambda: True)
+    monkeypatch.setattr(
+        runner, "docker_server_platform", lambda: "linux/arm64/fedora-43")
+    monkeypatch.setattr(
+        runner, "docker_endpoint",
+        lambda: "unix:///Users/test/.local/share/containers/podman/machine/podman.sock")
+    monkeypatch.setattr(k8s, "engine_capacity", lambda: (15.6, 4))
+    monkeypatch.setattr(k8s, "engine_resize_supported", lambda: True)
+
+    detected = onboarding.detect_environment()
+
+    assert detected["engine_provider"] == "podman"
 
 
 @pytest.mark.parametrize(

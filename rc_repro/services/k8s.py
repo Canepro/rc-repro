@@ -178,6 +178,9 @@ class _Runner:
     def docker_server_platform(self) -> str | None:
         return runner.docker_server_platform()
 
+    def docker_endpoint(self) -> str | None:
+        return runner.docker_endpoint()
+
     def run(self, argv: list[str], *, check: bool = True) -> subprocess.CompletedProcess:
         env = _client_env() if argv and argv[0] in {"kind", "kubectl", "helm"} else None
         return subprocess.run(argv, capture_output=True, text=True, check=check,
@@ -1222,7 +1225,11 @@ def engine_resize_supported(run: _Runner | None = None) -> bool:
     if not run.which("podman"):
         return False
     try:
-        if "podman" not in (run.docker_server_platform() or "").lower():
+        from rc_repro.services import onboarding
+        endpoint_probe = getattr(run, "docker_endpoint", lambda: None)
+        provider = onboarding.classify_engine_provider(
+            run.docker_server_platform(), endpoint_probe())
+        if provider != "podman":
             return False
         machine_result = run.run(
             ["podman", "machine", "inspect", "--format", "{{.State}}"],
@@ -1262,14 +1269,9 @@ def check_capacity(run: _Runner | None = None, emit: Emit = null_emit,
 
     provider = "unavailable"
     try:
-        platform = (run.docker_server_platform() or "").lower()
-        if "podman" in platform:
-            provider = "podman"
-        elif platform:
-            provider = "docker" if ("docker" in platform or "moby" in platform) \
-                else "docker-compatible"
-        else:
-            provider = "docker-compatible"
+        endpoint_probe = getattr(run, "docker_endpoint", lambda: None)
+        provider = onboarding.classify_engine_provider(
+            run.docker_server_platform(), endpoint_probe())
     except OSError:
         provider = "docker-compatible"
 

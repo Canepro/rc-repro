@@ -106,6 +106,9 @@ def test_acceptance_kubernetes_provider_and_capacity_branches(tmp_path, monkeypa
         environment=podman_env, draft={"deployment": "microservices"})
     assert podman_snap["capacity"]["code"] == onboarding.CAPACITY_GRANT_REQUIRED
     assert any(q["id"] == "engine_resize" for q in podman_snap["questions"])
+    assert podman_snap["license"]["required"] is True
+    assert podman_snap["license"]["seed_deferred"] is True
+    assert "--seed" not in podman_snap["first_run_command"]
 
     # Settled grant is not re-asked; conflict surfaces when denied.
     onboarding.apply_setup_patch({
@@ -171,6 +174,40 @@ def test_acceptance_targeted_section_reconfigure(tmp_path, monkeypatch):
     assert data["selection"]["seed_profile"] == "large"
     assert data["selection"]["scenarios"] == ["ldap"]
     assert data["selection"]["deployment"] == "default"
+
+
+def test_completed_kubernetes_setup_reopens_for_unanswered_authority(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(onboarding, "detect_environment", lambda: _env())
+    initial = CliRunner().invoke(app, [
+        "onboard", "--json", "--deployment", "microservices",
+    ])
+    assert initial.exit_code == 0, initial.output
+    assert onboarding.state()["completed"] is True
+    assert onboarding.state()["answered_grants"]["owned_cluster"] is False
+
+    resumed = CliRunner().invoke(app, ["onboard"], input="y\ny\n")
+
+    assert resumed.exit_code == 0, resumed.output
+    assert "May rc-repro create and later delete those owned resources?" in resumed.output
+    assert "Settled choices are unchanged" not in resumed.output
+    assert onboarding.state()["grants"]["owned_cluster"] is True
+
+
+def test_accept_defaults_records_only_applicable_grants(tmp_path, monkeypatch):
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(onboarding, "detect_environment", lambda: _env(
+        engine_provider="docker", missing_kubernetes_tools=["kind"],
+        microservices_ready=False))
+
+    result = CliRunner().invoke(app, [
+        "onboard", "--accept-defaults", "--json", "--deployment", "default",
+    ])
+
+    assert result.exit_code == 0, result.output
+    answered = onboarding.state()["answered_grants"]
+    assert answered == {"owned_cluster": False, "engine_resize": False}
 
 
 def test_acceptance_no_fullscreen_tui_dependency():
