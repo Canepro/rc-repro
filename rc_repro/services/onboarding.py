@@ -594,7 +594,8 @@ def capacity_assessment(environment: Mapping | None = None, *,
             ],
             "remediation": (
                 f"Engine has {detail}. Either raise memory yourself with "
-                f"`{resize_cmd}`, or grant engine-resize via `{approve}`."),
+                f"`{resize_cmd}`, or grant engine-resize via `{approve}` "
+                f"(note that restarting the engine stops unrelated containers)."),
             "verification": (
                 f"After resize or grant, re-run setup; memory must be "
                 f">= {required_mem:g} GiB."),
