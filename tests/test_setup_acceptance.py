@@ -29,6 +29,7 @@ def _env(**overrides):
                   "kubectl": "ok", "helm": "ok"},
         "docker_ready": True, "engine_provider": "podman",
         "engine_memory_gib": 15.0, "engine_cpus": 4,
+        "engine_kernel_version": "6.18.0",
         "missing_kubernetes_tools": [],
         "microservices_ready": True,
         "engine_resize_supported": False, "engine_resize_relevant": False,
@@ -221,6 +222,26 @@ def test_acceptance_no_fullscreen_tui_dependency():
     for banned in ("textual", "blessed", "prompt_toolkit", "npyscreen"):
         assert banned not in cli_src
     assert "_prompt_choice" in cli_src
+
+
+def test_interactive_scenario_prompt_accepts_numbered_choice(tmp_path, monkeypatch):
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(onboarding, "detect_environment", lambda: _env())
+
+    result = CliRunner().invoke(app, ["onboard"], input=(
+        "2\n"  # Kubernetes microservices
+        "1\n"  # LDAP, the only compatible scenario
+        "1\n"  # no seed
+        "n\n"  # teardown by default
+        "y\n"  # owned-cluster grant
+        "n\n"  # decline final write; prompt behavior is the assertion
+    ))
+
+    assert result.exit_code == 0, result.output
+    assert "1. ldap" in result.output
+    assert "scenarios: ldap" in result.output
+    assert "Traceback" not in result.output
+    assert "No changes written." in result.output
 
 
 def test_acceptance_first_run_never_repeats_settled_choices(tmp_path, monkeypatch):

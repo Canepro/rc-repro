@@ -19,6 +19,7 @@ def _compose_env(**overrides):
                   "kubectl": "missing", "helm": "missing"},
         "docker_ready": True, "engine_provider": "docker",
         "engine_memory_gib": 8.0, "engine_cpus": 4,
+        "engine_kernel_version": "6.18.0",
         "missing_kubernetes_tools": ["kind", "kubectl", "helm"],
         "microservices_ready": False,
         "engine_resize_supported": False, "engine_resize_relevant": False,
@@ -223,6 +224,29 @@ def test_podman_memory_shortfall_offers_resize_grant(tmp_path, monkeypatch):
     snap2 = onboarding.setup_snapshot(environment=env)
     assert snap2["capacity"]["code"] == onboarding.CAPACITY_INSUFFICIENT_MEMORY
     assert snap2["persisted"]["grants"]["engine_resize"] is True
+
+
+def test_first_run_is_blocked_by_mongodb_kernel_compatibility_gate(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    env = _compose_env(
+        engine_provider="podman",
+        engine_kernel_version="6.19.7-200.fc43.aarch64",
+    )
+
+    snap = onboarding.setup_snapshot(
+        environment=env, draft={"deployment": "default"})
+
+    assert snap["capacity"]["status"] == "not_applicable"
+    assert snap["compatibility"]["code"] == (
+        onboarding.COMPATIBILITY_MONGODB_KERNEL_UNSUPPORTED)
+    assert snap["compatibility"]["ready"] is False
+    assert snap["compatibility"]["mongo_version"] == "8.0"
+    assert snap["first_run_command"] == ""
+    assert snap["review"]["first_run_status"] == "blocked_compatibility"
+    gate = next(g for g in snap["gates"] if g["kind"] == "compatibility")
+    assert gate["code"] == onboarding.COMPATIBILITY_MONGODB_KERNEL_UNSUPPORTED
+    assert "SERVER-121912" in gate["remediation"]
 
 
 def test_insufficient_cpu_is_not_a_successful_preflight(tmp_path, monkeypatch):

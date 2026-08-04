@@ -1990,7 +1990,9 @@ def test_environment_detection_routes_docker_commands_through_runner(tmp_path, m
     monkeypatch.setattr(runner, "compose_version_line", lambda: "Docker Compose version v5.3.1")
     monkeypatch.setattr(runner, "docker_available", lambda: True)
     monkeypatch.setattr(runner, "docker_server_platform", lambda: "Docker Engine - Community")
+    monkeypatch.setattr(runner, "docker_server_components", lambda: ("Engine",))
     monkeypatch.setattr(runner, "docker_endpoint", lambda: "unix:///var/run/docker.sock")
+    monkeypatch.setattr(runner, "docker_kernel_version", lambda: "6.18.0")
     monkeypatch.setattr(k8s, "engine_capacity", lambda: (15.6, 4))
     monkeypatch.setattr(k8s, "engine_resize_supported", lambda: False)
 
@@ -1999,6 +2001,15 @@ def test_environment_detection_routes_docker_commands_through_runner(tmp_path, m
     assert detected["tools"]["docker"] == "Docker version 29.6.1"
     assert detected["tools"]["compose"] == "Docker Compose version v5.3.1"
     assert detected["engine_provider"] == "docker"
+
+
+def test_runner_reads_active_server_component_names(monkeypatch):
+    from rc_repro import runner
+    monkeypatch.setattr(
+        runner, "_first_line",
+        lambda _cmd: '[{"Name":"Podman Engine"},{"Name":"Conmon"}]')
+
+    assert runner.docker_server_components() == ("Podman Engine", "Conmon")
 
 
 def test_environment_detection_recognises_active_podman_socket(tmp_path, monkeypatch):
@@ -2012,15 +2023,43 @@ def test_environment_detection_recognises_active_podman_socket(tmp_path, monkeyp
     monkeypatch.setattr(runner, "docker_available", lambda: True)
     monkeypatch.setattr(
         runner, "docker_server_platform", lambda: "linux/arm64/fedora-43")
+    monkeypatch.setattr(runner, "docker_server_components", lambda: ("Engine",))
     monkeypatch.setattr(
         runner, "docker_endpoint",
         lambda: "unix:///Users/test/.local/share/containers/podman/machine/podman.sock")
+    monkeypatch.setattr(runner, "docker_kernel_version", lambda: "6.18.0")
     monkeypatch.setattr(k8s, "engine_capacity", lambda: (15.6, 4))
     monkeypatch.setattr(k8s, "engine_resize_supported", lambda: True)
 
     detected = onboarding.detect_environment()
 
     assert detected["engine_provider"] == "podman"
+
+
+def test_environment_detection_recognises_podman_server_component(
+        tmp_path, monkeypatch):
+    from rc_repro import runner
+    from rc_repro.services import k8s, onboarding
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(onboarding.shutil, "which", lambda tool: f"/usr/bin/{tool}")
+    monkeypatch.setattr(onboarding, "_version_line", lambda tool, *args: f"{tool} ok")
+    monkeypatch.setattr(runner, "docker_cli_version", lambda: "Docker version 29.7.1")
+    monkeypatch.setattr(runner, "compose_version_line", lambda: "Docker Compose version 5.3.1")
+    monkeypatch.setattr(runner, "docker_available", lambda: True)
+    monkeypatch.setattr(
+        runner, "docker_server_platform", lambda: "linux/arm64/fedora-43")
+    monkeypatch.setattr(
+        runner, "docker_server_components", lambda: ("Podman Engine", "Conmon"))
+    monkeypatch.setattr(
+        runner, "docker_endpoint", lambda: "unix:///var/run/docker.sock")
+    monkeypatch.setattr(runner, "docker_kernel_version", lambda: "6.19.7-200.fc43")
+    monkeypatch.setattr(k8s, "engine_capacity", lambda: (5.8, 5))
+    monkeypatch.setattr(k8s, "engine_resize_supported", lambda: True)
+
+    detected = onboarding.detect_environment()
+
+    assert detected["engine_provider"] == "podman"
+    assert detected["engine_kernel_version"] == "6.19.7-200.fc43"
 
 
 @pytest.mark.parametrize(
@@ -2037,6 +2076,10 @@ def test_environment_only_offers_resize_for_a_supported_memory_shortfall(
     monkeypatch.setattr(runner, "docker_cli_version", lambda: "Docker version 29.6.1")
     monkeypatch.setattr(runner, "compose_version_line", lambda: "Docker Compose version v5.3.1")
     monkeypatch.setattr(runner, "docker_available", lambda: True)
+    monkeypatch.setattr(runner, "docker_server_platform", lambda: "Podman Engine")
+    monkeypatch.setattr(runner, "docker_server_components", lambda: ("Podman Engine",))
+    monkeypatch.setattr(runner, "docker_endpoint", lambda: "unix:///var/run/docker.sock")
+    monkeypatch.setattr(runner, "docker_kernel_version", lambda: "6.18.0")
     monkeypatch.setattr(k8s, "engine_capacity", lambda: capacity)
     monkeypatch.setattr(k8s, "engine_resize_supported", lambda: resize_supported)
 

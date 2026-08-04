@@ -50,7 +50,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from rc_repro import __version__, config
+from rc_repro import __version__, config, versions
 from rc_repro.errors import AuthorityGateError, ValidationError
 
 #: The grants a human can hand over. Each exists because some action needs
@@ -114,6 +114,8 @@ CAPACITY_RESIZE_UNSUPPORTED = "CAPACITY_RESIZE_UNSUPPORTED"
 CAPACITY_ENGINE_UNAVAILABLE = "CAPACITY_ENGINE_UNAVAILABLE"
 CAPACITY_TOOLS_MISSING = "CAPACITY_TOOLS_MISSING"
 CAPACITY_GRANT_REQUIRED = "CAPACITY_GRANT_REQUIRED"
+COMPATIBILITY_OK = "COMPATIBILITY_OK"
+COMPATIBILITY_MONGODB_KERNEL_UNSUPPORTED = "COMPATIBILITY_MONGODB_KERNEL_UNSUPPORTED"
 
 
 def grant_key(name: str) -> str:
@@ -288,15 +290,20 @@ def _host_memory_gib() -> float:
 
 
 def classify_engine_provider(platform_name: str | None,
-                             endpoint: str | None = None) -> str:
+                             endpoint: str | None = None,
+                             components: Iterable[str] | None = None) -> str:
     """Classify the active Docker-compatible server from product and endpoint facts."""
     lower = (platform_name or "").strip().lower()
     endpoint_lower = (endpoint or "").strip().lower()
-    if "podman" in lower or "podman.sock" in endpoint_lower or "/podman/" in endpoint_lower:
+    component_lower = " ".join(str(item).strip().lower()
+                               for item in (components or ()))
+    if ("podman" in lower or "podman" in component_lower or
+            "podman.sock" in endpoint_lower or "/podman/" in endpoint_lower):
         return "podman"
     if not lower:
         return "docker-compatible"
-    if "docker" in lower or "moby" in lower:
+    if ("docker" in lower or "moby" in lower or
+            "docker" in component_lower or "moby" in component_lower):
         return "docker"
     # Colima, Rancher Desktop, etc. remain docker-compatible, never podman.
     return "docker-compatible"
@@ -313,7 +320,8 @@ def detect_engine_provider() -> str:
     if not runner.docker_available():
         return "unavailable"
     return classify_engine_provider(
-        runner.docker_server_platform(), runner.docker_endpoint())
+        runner.docker_server_platform(), runner.docker_endpoint(),
+        runner.docker_server_components())
 
 
 def detect_environment() -> dict:
@@ -339,6 +347,7 @@ def detect_environment() -> dict:
     docker_ready = runner.docker_available()
     engine_provider = detect_engine_provider() if docker_ready else "unavailable"
     engine_memory, engine_cpus = k8s.engine_capacity() if docker_ready else (0.0, 0)
+    engine_kernel = runner.docker_kernel_version() if docker_ready else None
     host_memory = _host_memory_gib()
     cpus = os.cpu_count() or 0
     try:
@@ -368,6 +377,7 @@ def detect_environment() -> dict:
         "engine_provider": engine_provider,
         "engine_memory_gib": engine_memory,
         "engine_cpus": engine_cpus,
+        "engine_kernel_version": engine_kernel,
         "missing_kubernetes_tools": missing,
         "microservices_ready": ready,
         "engine_resize_supported": resize_supported,
@@ -485,6 +495,50 @@ def build_first_run_command(*, deployment: str = "default",
         if "--seed" not in cmd:
             cmd = f"{cmd} --seed --seed-profile {seed_profile}"
     return cmd
+
+
+def compatibility_assessment(environment: Mapping | None = None, *,
+                             version: str = DEFAULT_FIRST_RUN_VERSION) -> dict[str, Any]:
+    """Whether the setup contract's proposed first run can start on this engine."""
+    from rc_repro.services import doctor
+
+    env = dict(environment or {})
+    if not env:
+        env = detect_environment()
+    kernel_text = str(env.get("engine_kernel_version") or "")
+    kernel = doctor._kernel_major_minor(kernel_text)
+    resolved = versions.resolve(version, offline=True)
+    try:
+        mongo_major = int(str(resolved.mongo_tag).split(".")[0])
+    except ValueError:
+        mongo_major = 0
+    result = {
+        "applicable": bool(kernel_text),
+        "version": version,
+        "mongo_version": resolved.mongo_tag,
+        "engine_kernel_version": kernel_text,
+        "status": "ok" if kernel_text else "unknown",
+        "ready": True,
+        "code": COMPATIBILITY_OK,
+        "supported_action": None,
+        "side_effects": [],
+        "remediation": "",
+        "verification": "docker info --format '{{.KernelVersion}}'",
+    }
+    if (mongo_major >= 8 and kernel and
+            kernel >= doctor.MONGO8_BAD_KERNEL):
+        result.update({
+            "status": "blocked",
+            "ready": False,
+            "code": COMPATIBILITY_MONGODB_KERNEL_UNSUPPORTED,
+            "supported_action": "change_engine_or_version",
+            "remediation": (
+                f"Rocket.Chat {version} requires MongoDB {resolved.mongo_tag}, which "
+                f"cannot start on engine kernel {kernel_text} (SERVER-121912). "
+                "Use an engine kernel below 6.19, or choose an older Rocket.Chat "
+                "line that pairs with MongoDB 7.0."),
+        })
+    return result
 
 
 def capacity_assessment(environment: Mapping | None = None, *,
@@ -830,11 +884,13 @@ def setup_snapshot(cfg: dict | None = None, *,
             "cpus": 0, "memory_gib": 0.0, "disk_free_gib": 0.0,
             "tools": {}, "docker_ready": False, "engine_provider": "unavailable",
             "engine_memory_gib": 0.0, "engine_cpus": 0,
+            "engine_kernel_version": "",
             "missing_kubernetes_tools": [], "microservices_ready": False,
             "engine_resize_supported": False, "engine_resize_relevant": False,
         }
 
     capacity = capacity_assessment(env, deployment=deployment, cfg=cfg)
+    compatibility = compatibility_assessment(env)
 
     # Section filter for targeted reconfiguration.
     section_filter = (section or "").strip().lower() or None
@@ -925,6 +981,18 @@ def setup_snapshot(cfg: dict | None = None, *,
     hidden_questions = [q for q in questions if not q["applicable"]]
 
     gates: list[dict[str, Any]] = []
+    if not compatibility.get("ready", True):
+        gates.append({
+            "kind": "compatibility",
+            "code": compatibility.get("code"),
+            "status": compatibility.get("status"),
+            "message": compatibility.get("remediation"),
+            "approve_with": "",
+            "remediation": compatibility.get("remediation"),
+            "verification": compatibility.get("verification"),
+            "supported_action": compatibility.get("supported_action"),
+            "side_effects": list(compatibility.get("side_effects") or []),
+        })
     if is_kubernetes and not capacity.get("ready", True):
         gate = {
             "kind": "capacity",
@@ -977,6 +1045,8 @@ def setup_snapshot(cfg: dict | None = None, *,
             view["grants"].get("owned_cluster") and capacity.get("ready")),
         seed_allowed=not seed_deferred,
     )
+    if not compatibility.get("ready", True):
+        first_run = ""
 
     review = {
         "deployment": deployment,
@@ -993,6 +1063,9 @@ def setup_snapshot(cfg: dict | None = None, *,
             "engine_resize": bool(view["grants"].get("engine_resize")),
         },
         "first_run_command": first_run,
+        "first_run_status": (
+            "ready" if first_run else "blocked_compatibility"
+        ),
         "capacity": {
             "code": capacity.get("code"),
             "status": capacity.get("status"),
@@ -1043,6 +1116,7 @@ def setup_snapshot(cfg: dict | None = None, *,
         },
         "environment": env,
         "capacity": capacity,
+        "compatibility": compatibility,
         "license": license_info,
         "questions": applicable_questions,
         "hidden_questions": hidden_questions,

@@ -178,6 +178,9 @@ class _Runner:
     def docker_server_platform(self) -> str | None:
         return runner.docker_server_platform()
 
+    def docker_server_components(self) -> tuple[str, ...]:
+        return runner.docker_server_components()
+
     def docker_endpoint(self) -> str | None:
         return runner.docker_endpoint()
 
@@ -1227,8 +1230,9 @@ def engine_resize_supported(run: _Runner | None = None) -> bool:
     try:
         from rc_repro.services import onboarding
         endpoint_probe = getattr(run, "docker_endpoint", lambda: None)
+        components_probe = getattr(run, "docker_server_components", lambda: ())
         provider = onboarding.classify_engine_provider(
-            run.docker_server_platform(), endpoint_probe())
+            run.docker_server_platform(), endpoint_probe(), components_probe())
         if provider != "podman":
             return False
         machine_result = run.run(
@@ -1270,8 +1274,9 @@ def check_capacity(run: _Runner | None = None, emit: Emit = null_emit,
     provider = "unavailable"
     try:
         endpoint_probe = getattr(run, "docker_endpoint", lambda: None)
+        components_probe = getattr(run, "docker_server_components", lambda: ())
         provider = onboarding.classify_engine_provider(
-            run.docker_server_platform(), endpoint_probe())
+            run.docker_server_platform(), endpoint_probe(), components_probe())
     except OSError:
         provider = "docker-compatible"
 

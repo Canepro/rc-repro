@@ -1444,7 +1444,10 @@ function renderSetupStep() {
         ] : []),
       ] : []),
       el("p", {}, `Retain runs: ${r.retain_runs ? "yes" : "no"}`),
-      el("p", {}, `First run: ${r.first_run_command || SETUP.snap.first_run_command || ""}`)));
+      el("p", { class: r.first_run_command ? "" : "hint bad" },
+        r.first_run_command
+          ? `First run: ${r.first_run_command}`
+          : `First run blocked: ${(SETUP.snap.compatibility || {}).code || "compatibility gate"}`)));
     const gates = SETUP.snap.gates || [];
     if (gates.length) {
       const box = el("div", { class: "setup-gates", role: "status" });

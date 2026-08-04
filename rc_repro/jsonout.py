@@ -213,6 +213,7 @@ def _error_codes() -> list[str]:
             "CAPACITY_INSUFFICIENT_MEMORY", "CAPACITY_RESIZE_UNSUPPORTED",
             "CAPACITY_ENGINE_UNAVAILABLE", "CAPACITY_TOOLS_MISSING",
             "CAPACITY_GRANT_REQUIRED",
+            "COMPATIBILITY_OK", "COMPATIBILITY_MONGODB_KERNEL_UNSUPPORTED",
         ):
             val = getattr(_ob, name, None)
             if isinstance(val, str):

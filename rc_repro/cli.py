@@ -2149,19 +2149,22 @@ def _prompt_choice(prompt: str, choices: list[dict], default: str = "") -> str:
 def _prompt_scenarios(choices: list[dict], current: list[str]) -> list[str]:
     if not choices or (len(choices) == 1 and choices[0].get("id") == ""):
         return []
-    typer.echo("Optional scenario (blank = deployment only; type an id from the list):")
-    for choice in choices:
-        typer.echo(f"  - {choice.get('id')}")
+    typer.echo("Optional scenario (blank = deployment only):")
+    for index, choice in enumerate(choices, start=1):
+        typer.echo(f"  {index}. {choice.get('label') or choice.get('id')}")
     default = current[0] if current else ""
-    raw = typer.prompt("Scenario", default=default, show_default=bool(default))
-    raw = str(raw).strip().lower()
-    if not raw:
-        return []
-    valid = {str(c.get("id")) for c in choices}
-    if raw not in valid:
-        raise errors.ValidationError(
-            f"unknown scenario {raw!r}; available: {', '.join(sorted(valid))}")
-    return [raw]
+    valid = {str(c.get("id")).lower(): str(c.get("id")) for c in choices}
+    while True:
+        raw = str(typer.prompt(
+            "Scenario", default=default, show_default=bool(default))).strip().lower()
+        if not raw:
+            return []
+        if raw.isdigit() and 1 <= int(raw) <= len(choices):
+            return [str(choices[int(raw) - 1].get("id"))]
+        if raw in valid:
+            return [valid[raw]]
+        ui.warn(
+            f"  unknown scenario {raw!r}; pick 1-{len(choices)} or type an id")
 
 
 @app.command()
@@ -2209,7 +2212,10 @@ def onboard(
         typer.echo(f"  scenarios: {', '.join(snap['selection']['scenarios']) or '(none)'}")
         typer.echo(f"  seed: {snap['selection']['seed_profile']}")
         typer.echo(f"  retain runs: {snap['selection']['retain_runs']}")
-        typer.echo(f"  first run: {snap['first_run_command']}")
+        if snap["first_run_command"]:
+            typer.echo(f"  first run: {snap['first_run_command']}")
+        else:
+            ui.warn(f"  first run: blocked by {snap['compatibility']['code']}")
         return
 
     structured = any(v is not None for v in (
@@ -2233,7 +2239,10 @@ def onboard(
             not reconfigure and not section and interactive and not structured):
         typer.echo("Settled choices are unchanged; use --reconfigure or "
                    "--section <name> to change them.")
-        ui.hint(f"  first run: {snap['first_run_command']}")
+        if snap["first_run_command"]:
+            ui.hint(f"  first run: {snap['first_run_command']}")
+        else:
+            ui.warn(f"  first run: blocked by {snap['compatibility']['code']}")
         return
 
     patch: dict = {}
@@ -2262,6 +2271,8 @@ def onboard(
                 f"  engine ({environment.get('engine_provider', '?')}): "
                 f"{environment['engine_cpus']} CPUs, "
                 f"{environment['engine_memory_gib']:.1f} GiB")
+            if environment.get("engine_kernel_version"):
+                typer.echo(f"  engine kernel: {environment['engine_kernel_version']}")
         typer.echo("")
 
         draft: dict = {}
@@ -2382,7 +2393,11 @@ def onboard(
         if live["selection"]["topology"] == "kubernetes":
             typer.echo(f"  owned-cluster: {live['review']['grants']['owned_cluster']}")
             typer.echo(f"  engine-resize: {live['review']['grants']['engine_resize']}")
-        typer.echo(f"  first run: {live['first_run_command']}")
+        if live["first_run_command"]:
+            typer.echo(f"  first run: {live['first_run_command']}")
+        else:
+            ui.warn(
+                f"  first run: blocked by {live['compatibility']['code']}")
         if not typer.confirm("Apply these choices?", default=True):
             ui.note("No changes written.")
             raise typer.Exit(0)
@@ -2441,6 +2456,7 @@ def onboard(
             "first_run_command": first_run,
             "selection": result_snap["selection"],
             "capacity": result_snap["capacity"],
+            "compatibility": result_snap["compatibility"],
             "gates": result_snap["gates"],
             "actions": result_snap["actions"],
         }))
@@ -2460,7 +2476,11 @@ def onboard(
                 state["answered_grants"].get(key)):
             typer.echo(f"  {name}: {mark}")
     typer.echo(f"  retain runs: {state['preferences']['retain_runs']}")
-    ui.hint(f"  first run: {first_run}")
+    if first_run:
+        ui.hint(f"  first run: {first_run}")
+    else:
+        ui.warn(
+            f"  first run: blocked by {result_snap['compatibility']['code']}")
     ui.hint("  change an answer with `rc-repro onboard --reconfigure` "
             "or `--section <name>`")
 
