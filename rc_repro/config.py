@@ -129,6 +129,11 @@ def preset_dir() -> Path:
     return home() / "presets"
 
 
+def capture_dir() -> Path:
+    """User-authored browser capture scenarios, overriding built-ins by name."""
+    return home() / "captures"
+
+
 def reports_dir() -> Path:
     """Where benchmark/perf reports are written by default."""
     return home() / "reports"

@@ -28,6 +28,7 @@ from rc_repro.services import envvars as envsvc
 from rc_repro.services import lifecycle as lcsvc
 from rc_repro.services import onboarding as onboardsvc
 from rc_repro.services import evidence as evidencesvc
+from rc_repro.services import capture as capturesvc
 from rc_repro.services import skill as skillsvc
 from rc_repro.services import events
 from rc_repro.services.events import Event, null_emit
@@ -2761,6 +2762,49 @@ def evidence(
                + (f" ({payload['retention']['reason']})"
                   if payload['retention']['reason'] else ""))
     typer.echo(f"  cleanup   {payload['retention']['cleanup']}")
+
+
+@app.command()
+def captures() -> None:
+    """List the browser capture scenarios available here."""
+    rows = capturesvc.list_scenarios()
+    if not rows:
+        ui.warn("no capture scenarios found")
+        return
+    for row in rows:
+        ui.ok(f"  {row['name']:16} {row['description'] or ''}")
+        if row["source"] != "built-in":
+            ui.hint(f"  {'':16} {row['source']}")
+
+
+@app.command()
+def capture(
+    name: str = typer.Option("", "--name", "-n"),
+    scenario: str = typer.Option("smoke", "--scenario",
+                                 help="scenario to drive (see `rc-repro captures`)"),
+    bundle: str = typer.Option("", "--bundle",
+                               help="bundle directory to write; defaults under ~/.rc-repro/reports"),
+    json_out: bool = typer.Option(True, "--json/--no-json"),
+) -> None:
+    """Drive a scripted reproduction in a browser and write an attachable bundle.
+
+    Produces the complete thing in one go: screenshots per checkpoint, a video, a
+    Playwright trace, the evidence record, and a README that ties them together.
+    Needs the optional extra: `pip install 'rc-repro\\[capture]'`.
+
+    A step whose selector does not match fails the run (exit 9) rather than
+    shooting a blank page, because a half-run capture still looks like proof.
+    """
+    payload: dict = {}
+    try:
+        payload = capturesvc.capture_bundle(name, scenario, bundle)
+    except errors.ReproError as exc:
+        jsonout.fail(exc) if json_out else _fail(exc)
+    if json_out:
+        jsonout.emit(jsonout.envelope("capture", payload))
+        return
+    ui.ok(f"bundle  {payload['bundle']['path']}")
+    ui.hint(f"  open  {payload['bundle']['path']}/README.md")
 
 
 @app.command()

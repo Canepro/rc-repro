@@ -20,6 +20,9 @@ dependencies = [
 # releases; some releases hard-require httpx2 while older ones use httpx.
 dev = ["pytest>=7", "httpx>=0.27", "httpx2>=2.9", "ruff>=0.6"]
 gui = ["fastapi>=0.110", "uvicorn>=0.29", "python-multipart>=0.0.9", "websockets>=12"]
+# Browser capture is opt-in: most people want a Rocket.Chat container, not a
+# ~500MB browser download. `rc-repro capture` says so when it is missing.
+capture = ["playwright>=1.40"]
 
 [project.scripts]
 rc-repro = "rc_repro.cli:app"
@@ -28,7 +31,7 @@ rc-repro = "rc_repro.cli:app"
 packages = ["rc_repro", "rc_repro.presets", "rc_repro.perf", "rc_repro.services", "rc_repro.web"]
 
 [tool.setuptools.package-data]
-rc_repro = ["data/*.yaml", "data/presets/*.yaml", "data/monitoring/*.json", "data/loadtest/*.js", "data/webui/*", "data/skill/*.md"]
+rc_repro = ["data/*.yaml", "data/presets/*.yaml", "data/captures/*.yaml", "data/monitoring/*.json", "data/loadtest/*.js", "data/webui/*", "data/skill/*.md"]
 
 [tool.ruff]
 line-length = 110

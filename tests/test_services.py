@@ -2827,3 +2827,417 @@ def test_set_env_can_write_without_restarting(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "up", lambda n, pull=True: called.append(n) or 0)
     r = envvars.set_env("e", {"A": "1"}, [], restart=False, emit=lambda ev: None)
     assert r["restarted"] is False and called == [], "must not touch containers"
+
+
+# --- capture ---------------------------------------------------------------------
+
+
+class _FakeDriver:
+    """Records calls instead of driving a browser.
+
+    The scenario runner is the part with logic worth testing (ordering, redaction,
+    what a failure does to the manifest); a real browser would only slow that down
+    and make it flaky. `missing` names selectors the driver refuses to find, which
+    is how a version-drifted scenario is simulated.
+    """
+
+    def __init__(self, missing: tuple[str, ...] = ()):
+        self.calls: list[tuple] = []
+        self.missing = missing
+        self.finished = False
+
+    def _check(self, selector: str) -> None:
+        if selector in self.missing:
+            raise LookupError(f"no element matches {selector!r}")
+
+    def goto(self, url):                 self.calls.append(("goto", url))
+    def press(self, key):                self.calls.append(("press", key))
+
+    def click(self, selector, timeout_ms):
+        self._check(selector)
+        self.calls.append(("click", selector, timeout_ms))
+
+    def fill(self, selector, value, timeout_ms):
+        self._check(selector)
+        self.calls.append(("fill", selector, value, timeout_ms))
+
+    def wait_for(self, selector, timeout_ms):
+        self._check(selector)
+        self.calls.append(("wait_for", selector, timeout_ms))
+
+    def screenshot(self, path):
+        Path(path).write_bytes(b"\x89PNG fake")
+        self.calls.append(("screenshot", Path(path).name))
+
+    def finish(self):
+        self.finished = True
+        return {"video": None, "trace": None}
+
+
+def _write_scenario(name, body):
+    """Write a user scenario; conftest already points RC_REPRO_HOME at a tmp dir."""
+    from rc_repro import config
+    d = config.capture_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{name}.yaml").write_text(body, encoding="utf-8")
+    return name
+
+
+def test_capture_rejects_an_unknown_action(tmp_path, monkeypatch):
+    # A typo'd action must fail at load, not silently do nothing mid-run: a
+    # scenario that skips its own assertion still produces screenshots and would
+    # read as proof.
+    from rc_repro.services import capture
+    _write_scenario("bad", """
+name: bad
+steps:
+  - clcik: "button"
+""")
+    with pytest.raises(errors.ValidationError) as ei:
+        capture.load_scenario("bad")
+    assert "clcik" in str(ei.value)
+
+
+def test_capture_rejects_a_step_with_no_target(tmp_path, monkeypatch):
+    from rc_repro.services import capture
+    _write_scenario("empty", """
+name: empty
+steps:
+  - click: ""
+""")
+    with pytest.raises(errors.ValidationError):
+        capture.load_scenario("empty")
+
+
+def test_capture_user_scenario_overrides_a_builtin(tmp_path, monkeypatch):
+    # Mirrors the preset rule: a user file wins, so a drifted built-in can be
+    # fixed locally without waiting for a release.
+    from rc_repro.services import capture
+    assert capture.load_scenario("smoke").description         # built-in exists
+    _write_scenario("smoke", """
+name: smoke
+description: mine
+steps:
+  - goto: "/"
+""")
+    s = capture.load_scenario("smoke")
+    assert s.description == "mine" and len(s.steps) == 1
+
+
+def test_capture_records_every_checkpoint_in_order(tmp_path, monkeypatch):
+    from rc_repro.services import capture
+    _write_scenario("flow", """
+name: flow
+steps:
+  - goto: "/"
+  - shot: landing
+  - click: "button.login"
+  - shot: after-login
+""")
+    drv = _FakeDriver()
+    man = capture.run(capture.load_scenario("flow"), drv, tmp_path / "cap",
+                      context={"root_url": "http://localhost:3000"})
+
+    assert man["status"] == "ok"
+    assert man["shots"] == ["01-landing.png", "02-after-login.png"]
+    assert [c[0] for c in drv.calls] == \
+        ["goto", "screenshot", "click", "screenshot"]
+    assert drv.calls[0] == ("goto", "http://localhost:3000/")
+    assert drv.finished, "the driver must be closed so video is flushed"
+    assert (tmp_path / "cap" / "01-landing.png").exists()
+
+
+def test_capture_fails_loudly_when_a_selector_is_missing(tmp_path, monkeypatch):
+    # The sharpest risk in a version-matched tool: a scenario written against one
+    # RC version pointed at another. A missing selector must abort with the step
+    # named, never shoot a blank page and call it evidence.
+    from rc_repro.services import capture
+    _write_scenario("drift", """
+name: drift
+steps:
+  - goto: "/"
+  - click: "button.gone"
+  - shot: never-reached
+""")
+    drv = _FakeDriver(missing=("button.gone",))
+    with pytest.raises(errors.CaptureFailedError) as ei:
+        capture.run(capture.load_scenario("drift"), drv, tmp_path / "cap",
+                    context={"root_url": "http://x:3000"})
+
+    man = json.loads((tmp_path / "cap" / "manifest.json").read_text())
+    assert man["status"] == "failed"
+    assert man["failed_step"]["action"] == "click"
+    assert man["failed_step"]["target"] == "button.gone"
+    assert man["failed_step"]["index"] == 1
+    assert "button.gone" in str(ei.value)
+    assert "never-reached" not in json.dumps(man["shots"])
+    assert drv.finished, "artifacts so far must still be flushed for debugging"
+
+
+def test_capture_manifest_never_contains_a_resolved_secret(tmp_path, monkeypatch):
+    # evidence.py's contract is that no password appears anywhere, and a capture
+    # manifest ships in the same bundle. Recording the authored template rather
+    # than the substituted value makes that structural instead of a filter.
+    from rc_repro.services import capture
+    _write_scenario("login", """
+name: login
+steps:
+  - fill: "input[name=pass]"
+    value: "{{admin_pass}}"
+  - fill: "input[name=msg]"
+    value: hello
+""")
+    drv = _FakeDriver()
+    man = capture.run(capture.load_scenario("login"), drv, tmp_path / "cap",
+                      context={"root_url": "http://x:3000", "admin_pass": "hunter2"})
+
+    blob = json.dumps(man)
+    assert "hunter2" not in blob
+    assert "{{admin_pass}}" in blob, "the step is still described, just unresolved"
+    assert "hello" in blob, "an ordinary typed value stays readable"
+    assert ("fill", "input[name=pass]", "hunter2", 15000) in drv.calls, "the browser got the real value"
+
+
+def test_capture_redacts_a_hardcoded_password_value(tmp_path, monkeypatch):
+    # A scenario author who inlines a credential instead of using a placeholder
+    # must not put it in an attachable bundle.
+    from rc_repro.services import capture
+    _write_scenario("inline", """
+name: inline
+steps:
+  - fill: "input[name=password]"
+    value: "s3cr3t-inline"
+""")
+    man = capture.run(capture.load_scenario("inline"), _FakeDriver(), tmp_path / "cap",
+                      context={"root_url": "http://x:3000"})
+    assert "s3cr3t-inline" not in json.dumps(man)
+    assert man["steps"][0]["value"] == "REDACTED"
+
+
+def test_capture_driver_needs_the_optional_extra(monkeypatch):
+    # The extra is opt-in, so its absence must read as an install instruction
+    # rather than an ImportError traceback.
+    from rc_repro.services import capture
+    monkeypatch.setattr(capture, "_import_playwright", _raise_import)
+    with pytest.raises(errors.ReproError) as ei:
+        capture.browser_driver("http://x:3000", Path("/tmp/x"))
+    assert "rc-repro[capture]" in str(ei.value)
+
+
+def _raise_import():
+    raise ImportError("no module named playwright")
+
+
+def test_evidence_bundle_writes_a_readable_readme(tmp_path, monkeypatch):
+    # The whole point of --bundle is that a human attaches it to a case. A folder
+    # of JSON is not that; the README is what a reader actually opens.
+    from rc_repro.services import evidence, k8s
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    k8s.create_repro("e6", "8.6.1", offline=True, port=31405, run=_FakeRun())
+    rec = evidence.record("e6")
+    out = evidence.write_bundle("e6", tmp_path / "b", rec)
+
+    assert "README.md" in out["files"]
+    md = (tmp_path / "b" / "README.md").read_text()
+    assert "8.6.1" in md and "kubernetes" in md
+    assert "rc-repro down --name e6 --volumes --yes" in md, "cleanup stays pasteable"
+    assert "admin123" not in md
+
+
+def test_evidence_readme_embeds_capture_artifacts(tmp_path, monkeypatch):
+    # A screenshot nobody links to is a file nobody opens.
+    from rc_repro.services import evidence, k8s
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    k8s.create_repro("e7", "8.6.1", offline=True, port=31406, run=_FakeRun())
+    cap = tmp_path / "b" / "capture"
+    cap.mkdir(parents=True)
+    (cap / "manifest.json").write_text(json.dumps({
+        "scenario": "smoke", "status": "ok",
+        "steps": [{"index": 0, "action": "goto", "target": "/", "status": "ok"}],
+        "shots": ["01-landing.png"], "video": "video.webm", "trace": "trace.zip",
+        "failed_step": None,
+    }))
+    evidence.write_bundle("e7", tmp_path / "b", evidence.record("e7"))
+
+    md = (tmp_path / "b" / "README.md").read_text()
+    assert "![01-landing](capture/01-landing.png)" in md
+    assert "capture/video.webm" in md
+    assert "goto" in md, "the reproduction steps belong in the report"
+
+
+def test_capture_secret_values_are_keyed_off_the_placeholder_name():
+    from rc_repro.services import capture
+    got = capture.secret_values({"root_url": "http://x", "admin_user": "admin",
+                                 "admin_pass": "hunter2", "reg_token": "T"})
+    assert set(got) == {"hunter2", "T"}
+
+
+def test_capture_redacts_the_playwright_trace(tmp_path):
+    # Playwright records every action's arguments verbatim, so a fill of the admin
+    # password lands in trace.trace in clear text. Verified against a real trace:
+    # without this pass the trace is the one artifact in the bundle that cannot be
+    # attached to a case.
+    import zipfile
+    from rc_repro.services import capture
+
+    trace = tmp_path / "trace.zip"
+    with zipfile.ZipFile(trace, "w") as zf:
+        zf.writestr("trace.trace", '{"params":{"value":"hunter2"}}\n{"a":1}')
+        zf.writestr("resources/x.bin", b"\x00binary hunter2 blob")
+
+    assert capture.redact_trace(trace, ("hunter2",)) is True
+    with zipfile.ZipFile(trace) as zf:
+        assert set(zf.namelist()) == {"trace.trace", "resources/x.bin"}
+        for entry in zf.namelist():
+            assert b"hunter2" not in zf.read(entry)
+        assert b"REDACTED" in zf.read("trace.trace")
+
+    # A second pass has nothing to do and must not rewrite the file.
+    assert capture.redact_trace(trace, ("hunter2",)) is False
+    assert capture.redact_trace(trace, ()) is False
+
+
+def test_capture_honours_timeout_ms_on_every_waiting_action(tmp_path):
+    # A modifier that parses but is ignored is worse than one that is rejected: a
+    # click during a slow boot would fail at the default and report "your selectors
+    # may have moved" when the real cause was the clock.
+    from rc_repro.services import capture
+    _write_scenario("slow", """
+name: slow
+steps:
+  - click: "button.a"
+    timeout_ms: 60000
+  - fill: "input.b"
+    value: x
+    timeout_ms: 45000
+  - wait_for: "div.c"
+    timeout_ms: 30000
+  - click: "button.d"
+""")
+    drv = _FakeDriver()
+    capture.run(capture.load_scenario("slow"), drv, tmp_path / "cap", context={})
+    assert drv.calls == [
+        ("click", "button.a", 60000),
+        ("fill", "input.b", "x", 45000),
+        ("wait_for", "div.c", 30000),
+        ("click", "button.d", 15000),          # falls back to the default
+    ]
+
+
+def test_capture_redacts_a_secret_embedded_in_an_unremarkable_field(tmp_path):
+    # Two different protections, and the distinction matters. A placeholder in an
+    # ordinary field is already safe because nothing resolves it into the record, so
+    # it stays readable. A literal copy of the real secret is not safe, and the
+    # selector-name rule cannot catch it in a field called "note".
+    from rc_repro.services import capture
+    _write_scenario("embed", """
+name: embed
+steps:
+  - fill: "textarea#note"
+    value: "the password is {{admin_pass}}"
+  - fill: "textarea#pasted"
+    value: "the password is hunter2"
+""")
+    man = capture.run(capture.load_scenario("embed"), _FakeDriver(), tmp_path / "cap",
+                      context={"admin_pass": "hunter2"})
+
+    assert "hunter2" not in json.dumps(man)
+    assert man["steps"][0]["value"] == "the password is {{admin_pass}}"
+    assert man["steps"][1]["value"] == "REDACTED"
+
+
+def test_capture_drops_a_trace_it_could_not_scrub(tmp_path):
+    # An unscrubbed trace is worse than no trace: the README promises the bundle is
+    # attachable, so an artifact that cannot be certified must not ship.
+    from rc_repro.services import capture
+    trace = tmp_path / "trace.zip"
+    trace.write_bytes(b"not a zip at all")
+    with pytest.raises(Exception):
+        capture.redact_trace(trace, ("hunter2",))
+
+
+def test_capture_readme_states_a_missing_recording(tmp_path):
+    from rc_repro.services import capture
+    md = "\n".join(capture.render_section(
+        {"status": "ok", "steps": [], "shots": [], "video": None, "trace": None}))
+    assert "No video or trace was produced" in md
+
+
+def test_evidence_readme_renders_runtime_services_as_a_table(tmp_path, monkeypatch):
+    # These arrive as dicts; `- {'service': ...}` in the one section describing live
+    # state is exactly the unreadability the render exists to remove.
+    from rc_repro.services import evidence, k8s
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    k8s.create_repro("e8", "8.6.1", offline=True, port=31407, run=_FakeRun())
+    rec = evidence.record("e8")
+    md = evidence.render_markdown(rec)
+    assert "{'service'" not in md and "{&#39;service&#39;" not in md
+    if rec["runtime"]["services"]:
+        assert "| Service | State | Status |" in md
+
+
+def test_evidence_readme_flags_a_failed_capture(tmp_path, monkeypatch):
+    # The banner is the whole point of rendering a failed capture at all: a reader
+    # must not take partial screenshots for proof of the behaviour.
+    from rc_repro.services import evidence, k8s
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    k8s.create_repro("e9", "8.6.1", offline=True, port=31408, run=_FakeRun())
+    cap = tmp_path / "b" / "capture"
+    cap.mkdir(parents=True)
+    (cap / "manifest.json").write_text(json.dumps({
+        "scenario": "drift", "status": "failed",
+        "steps": [{"index": 0, "action": "click", "target": "button.gone",
+                   "status": "failed"}],
+        "shots": [], "video": None, "trace": None,
+        "failed_step": {"index": 0, "action": "click", "target": "button.gone"},
+    }))
+    evidence.write_bundle("e9", tmp_path / "b", evidence.record("e9"))
+    md = (tmp_path / "b" / "README.md").read_text()
+    assert "This capture did not complete" in md
+    assert "button.gone" in md
+
+
+def test_capture_bundle_is_written_even_when_the_capture_fails(tmp_path, monkeypatch):
+    # The ordering is the point: a drifted scenario must still leave the README whose
+    # banner explains where it stopped. Losing the bundle on failure would throw away
+    # exactly the artifacts that show what went wrong.
+    from rc_repro.services import capture, k8s
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    k8s.create_repro("cb1", "8.6.1", offline=True, port=31409, run=_FakeRun())
+    _write_scenario("drift", """
+name: drift
+steps:
+  - goto: "/"
+  - shot: landing
+  - click: "button.gone"
+""")
+    drv = _FakeDriver(missing=("button.gone",))
+    with pytest.raises(errors.CaptureFailedError) as ei:
+        capture.capture_bundle("cb1", "drift", tmp_path / "b",
+                               driver_factory=lambda *a, **k: drv)
+
+    bundle = Path(ei.value.details["bundle"])
+    md = (bundle / "README.md").read_text()
+    assert "This capture did not complete" in md
+    assert "button.gone" in md
+    assert (bundle / "capture" / "01-landing.png").exists()
+    assert (bundle / "manifest.json").exists()
+    assert ei.value.exit_code == 9
+
+
+def test_capture_bundle_returns_the_payload_on_success(tmp_path, monkeypatch):
+    from rc_repro.services import capture, k8s
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    k8s.create_repro("cb2", "8.6.1", offline=True, port=31410, run=_FakeRun())
+    _write_scenario("ok", """
+name: ok
+steps:
+  - goto: "/"
+  - shot: landing
+""")
+    payload = capture.capture_bundle("cb2", "ok", tmp_path / "b2",
+                                     driver_factory=lambda *a, **k: _FakeDriver())
+    assert "README.md" in payload["bundle"]["files"]
+    md = (Path(payload["bundle"]["path"]) / "README.md").read_text()
+    assert "![01-landing](capture/01-landing.png)" in md
+    assert "admin123" not in md

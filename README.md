@@ -893,7 +893,9 @@ rc-repro api --name test --2fa  POST /api/v1/settings/<id> -d '{"value":true}'
 | `versions <X.Y.Z>` | show the resolved MongoDB pairing (without launching) |
 | `doctor` | preflight checks (Docker, Compose, engine kernel, Hub auth, disk, ports, connectivity; `--json` for the machine-readable record) |
 | `prune` | delete all `down` repros, then the empty rc-repro-owned Kind cluster (confirms first, `--yes` to skip) |
-| `evidence` | a secret-safe, backend-neutral record of what was deployed and how it is behaving; `--bundle <dir>` also writes logs and the rendered artifact |
+| `evidence` | a secret-safe, backend-neutral record of what was deployed and how it is behaving; `--bundle <dir>` also writes logs, the rendered artifact, and a `README.md` a person can read |
+| `capture` | drive a scripted reproduction in a browser and write an attachable bundle: screenshot per checkpoint, video, Playwright trace, evidence record, README (needs `pip install 'rc-repro[capture]'`) |
+| `captures` | list available capture scenarios |
 | `capabilities` | what this build can do (contract version, commands, phases, error/exit codes, presets, topologies); the discovery call an agent reads first |
 | `onboard` | inspect the machine and answer owned-cluster, conditional engine-resize, and retention questions once; `--accept-defaults` is for non-interactive automation |
 | `skill install` / `skill status` | install the versioned rc-repro agent skill into an agent host (`claude`, `codex`; Cursor and Copilot read those) |
@@ -902,6 +904,59 @@ Run `rc-repro <command> --help` for flags.
 
 `up`, `ready`, `down`, `list`, `info`, `inspect`, `evidence`, `doctor` and `capabilities`
 accept `--json` for scripts and agents (see [Agent & JSON interface](#agent--json-interface)).
+
+## Capturing a reproduction
+
+`evidence` proves what was deployed. It does not prove *do X, then Y goes wrong*,
+which is the shape of nearly every escalation. `capture` drives a scripted
+reproduction through a real browser and writes the whole attachable bundle in one
+command:
+
+```bash
+pip install 'rc-repro[capture]' && playwright install chromium
+
+rc-repro captures                                       # list scenarios
+rc-repro capture --name my-repro --scenario smoke       # run one
+```
+
+The bundle contains a screenshot per named checkpoint, a video of the run, a
+Playwright trace (`npx playwright show-trace capture/trace.zip`), the evidence
+record, and a `README.md` linking them together. That README is the file you
+attach; the JSON stays authoritative for scripts.
+
+Write a scenario for your own reproduction by copying the built-in `smoke` into
+`~/.rc-repro/captures/<name>.yaml`. A user file overrides a built-in of the same
+name, which is also how you repair a shipped scenario after a UI change:
+
+```yaml
+name: my-repro
+description: What this demonstrates.
+steps:
+  - goto: "/"
+  - wait_for: "input[name=usernameOrEmail]"
+    timeout_ms: 60000
+  - shot: landing
+  - fill: "input[name=usernameOrEmail]"
+    value: "{{admin_user}}"
+  - fill: "input[name=password]"
+    value: "{{admin_pass}}"
+  - click: "button[type=submit]"
+  - shot: signed-in
+```
+
+Two things worth knowing:
+
+**A capture that cannot finish fails (exit 9).** rc-repro runs version-matched
+repros and Rocket.Chat's selectors move between versions, so a scenario authored
+against one version may find nothing on another. Rather than shooting a blank page
+that still looks like evidence, the run stops and the manifest names the step that
+could not run.
+
+**Credentials go in as `{{placeholders}}`.** They are substituted for the browser
+but recorded unresolved, so the manifest describes what happened without carrying a
+secret. A literal typed into a password field is redacted, and the Playwright trace
+is scrubbed before it is written, because Playwright records every action's
+arguments verbatim.
 
 ## Kubernetes microservices preset
 

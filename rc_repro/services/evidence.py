@@ -220,6 +220,76 @@ def record(name: str, *, retained: bool | None = None,
     return payload
 
 
+def _kv_table(rows: list[tuple[str, str]]) -> list[str]:
+    out = ["| | |", "|---|---|"]
+    out += [f"| {k} | {v} |" for k, v in rows if v]
+    return out
+
+
+def render_markdown(payload: dict, capture: dict | None = None) -> str:
+    """Render the record (and any capture) as the page a human actually opens.
+
+    The JSON is the machine contract and stays authoritative, but a folder of JSON
+    is not something anyone attaches to an escalation and expects read. This is the
+    same facts in the order a reader needs them: what was deployed, what was done to
+    it, what it looked like, and how to clean it up.
+
+    It renders only from `payload`, which is already secret-safe, so the readable
+    view cannot leak something the machine view withheld.
+    """
+    repro = payload.get("repro", {})
+    lic = payload.get("license", {})
+    runtime = payload.get("runtime", {})
+    name = repro.get("name", "?")
+
+    lines = [f"# Repro `{name}` — Rocket.Chat {repro.get('rc_version', '?')}", ""]
+    if capture and capture.get("description"):
+        lines += [capture["description"], ""]
+
+    mongo = repro.get("mongo_tag", "")
+    if mongo and repro.get("mongo_flavor"):
+        mongo = f"{mongo} ({repro['mongo_flavor']})"
+    lines += _kv_table([
+        ("Rocket.Chat", f"{repro.get('rc_version', '')} (`{repro.get('rc_image', '')}`)"),
+        ("MongoDB", mongo),
+        ("Topology", repro.get("topology", "")),
+        ("Preset", repro.get("preset", "") or "none"),
+        ("URL", repro.get("root_url", "")),
+        ("Created", repro.get("created_at", "")),
+        ("Licensed", "yes" if lic.get("supplied") else
+                     ("no (required)" if lic.get("required") else "not required")),
+        ("State", str(runtime.get("state", ""))),
+    ]) + [""]
+
+    lines += ["## Reproduction", ""]
+    if not capture:
+        lines += ["No scripted capture was run, so this bundle proves what was "
+                  "deployed but not what was done to it. Add one with "
+                  f"`rc-repro capture --name {name} --scenario smoke`.", ""]
+    else:
+        from rc_repro.services import capture as capturesvc
+        lines += capturesvc.render_section(capture)
+
+    services = runtime.get("services") or []
+    if services:
+        # A table, not a repr: these arrive as dicts, and `- {'service': ...}` in
+        # the one section describing live state is exactly the unreadability this
+        # render exists to remove.
+        lines += ["## Runtime", "", "| Service | State | Status |", "|---|---|---|"]
+        for svc in services:
+            if isinstance(svc, dict):
+                lines.append(f"| {svc.get('service', '')} | {svc.get('state', '')} "
+                             f"| {svc.get('status', '')} |")
+            else:
+                lines.append(f"| {svc} | | |")
+        lines.append("")
+
+    cleanup = (payload.get("retention") or {}).get("cleanup", "")
+    if cleanup:
+        lines += ["## Cleanup", "", "```bash", cleanup, "```", ""]
+    return "\n".join(lines)
+
+
 def write_bundle(name: str, dest: str | Path, payload: dict) -> dict:
     """Write a bundle: the record plus logs and the rendered artifact.
 
@@ -233,6 +303,18 @@ def write_bundle(name: str, dest: str | Path, payload: dict) -> dict:
     (out / "manifest.json").write_text(json.dumps(payload, indent=2, sort_keys=True),
                                        encoding="utf-8")
     written = ["manifest.json"]
+
+    # A capture, if one ran, wrote itself here first. Reading it rather than being
+    # handed it keeps the two commands independent: either can run alone.
+    capture = None
+    cap_manifest = out / "capture" / "manifest.json"
+    if cap_manifest.exists():
+        try:
+            capture = json.loads(cap_manifest.read_text(encoding="utf-8"))
+        except ValueError:
+            capture = None
+    (out / "README.md").write_text(render_markdown(payload, capture), encoding="utf-8")
+    written.append("README.md")
 
     artifact = payload.get("artifact", {}).get("name") or ""
     if artifact:
