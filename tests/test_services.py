@@ -2835,10 +2835,10 @@ def test_set_env_can_write_without_restarting(tmp_path, monkeypatch):
 class _FakeDriver:
     """Records calls instead of driving a browser.
 
-    The scenario runner is the part with logic worth testing (ordering, redaction,
+    The workload runner is the part with logic worth testing (ordering, redaction,
     what a failure does to the manifest); a real browser would only slow that down
     and make it flaky. `missing` names selectors the driver refuses to find, which
-    is how a version-drifted scenario is simulated.
+    is how a version-drifted workload is simulated.
     """
 
     def __init__(self, missing: tuple[str, ...] = ()):
@@ -2874,10 +2874,10 @@ class _FakeDriver:
         return {"video": None, "trace": None}
 
 
-def _write_scenario(name, body):
-    """Write a user scenario; conftest already points RC_REPRO_HOME at a tmp dir."""
+def _write_workload(name, body):
+    """Write a user workload; conftest already points RC_REPRO_HOME at a tmp dir."""
     from rc_repro import config
-    d = config.capture_dir()
+    d = config.workload_dir()
     d.mkdir(parents=True, exist_ok=True)
     (d / f"{name}.yaml").write_text(body, encoding="utf-8")
     return name
@@ -2885,48 +2885,48 @@ def _write_scenario(name, body):
 
 def test_capture_rejects_an_unknown_action(tmp_path, monkeypatch):
     # A typo'd action must fail at load, not silently do nothing mid-run: a
-    # scenario that skips its own assertion still produces screenshots and would
+    # workload that skips its own assertion still produces screenshots and would
     # read as proof.
     from rc_repro.services import capture
-    _write_scenario("bad", """
+    _write_workload("bad", """
 name: bad
 steps:
   - clcik: "button"
 """)
     with pytest.raises(errors.ValidationError) as ei:
-        capture.load_scenario("bad")
+        capture.load_workload("bad")
     assert "clcik" in str(ei.value)
 
 
 def test_capture_rejects_a_step_with_no_target(tmp_path, monkeypatch):
     from rc_repro.services import capture
-    _write_scenario("empty", """
+    _write_workload("empty", """
 name: empty
 steps:
   - click: ""
 """)
     with pytest.raises(errors.ValidationError):
-        capture.load_scenario("empty")
+        capture.load_workload("empty")
 
 
-def test_capture_user_scenario_overrides_a_builtin(tmp_path, monkeypatch):
+def test_capture_user_workload_overrides_a_builtin(tmp_path, monkeypatch):
     # Mirrors the preset rule: a user file wins, so a drifted built-in can be
     # fixed locally without waiting for a release.
     from rc_repro.services import capture
-    assert capture.load_scenario("smoke").description         # built-in exists
-    _write_scenario("smoke", """
+    assert capture.load_workload("smoke").description         # built-in exists
+    _write_workload("smoke", """
 name: smoke
 description: mine
 steps:
   - goto: "/"
 """)
-    s = capture.load_scenario("smoke")
+    s = capture.load_workload("smoke")
     assert s.description == "mine" and len(s.steps) == 1
 
 
 def test_capture_records_every_checkpoint_in_order(tmp_path, monkeypatch):
     from rc_repro.services import capture
-    _write_scenario("flow", """
+    _write_workload("flow", """
 name: flow
 steps:
   - goto: "/"
@@ -2935,7 +2935,7 @@ steps:
   - shot: after-login
 """)
     drv = _FakeDriver()
-    man = capture.run(capture.load_scenario("flow"), drv, tmp_path / "cap",
+    man = capture.run(capture.load_workload("flow"), drv, tmp_path / "cap",
                       context={"root_url": "http://localhost:3000"})
 
     assert man["status"] == "ok"
@@ -2948,11 +2948,11 @@ steps:
 
 
 def test_capture_fails_loudly_when_a_selector_is_missing(tmp_path, monkeypatch):
-    # The sharpest risk in a version-matched tool: a scenario written against one
+    # The sharpest risk in a version-matched tool: a workload written against one
     # RC version pointed at another. A missing selector must abort with the step
     # named, never shoot a blank page and call it evidence.
     from rc_repro.services import capture
-    _write_scenario("drift", """
+    _write_workload("drift", """
 name: drift
 steps:
   - goto: "/"
@@ -2961,7 +2961,7 @@ steps:
 """)
     drv = _FakeDriver(missing=("button.gone",))
     with pytest.raises(errors.CaptureFailedError) as ei:
-        capture.run(capture.load_scenario("drift"), drv, tmp_path / "cap",
+        capture.run(capture.load_workload("drift"), drv, tmp_path / "cap",
                     context={"root_url": "http://x:3000"})
 
     man = json.loads((tmp_path / "cap" / "manifest.json").read_text())
@@ -2979,7 +2979,7 @@ def test_capture_manifest_never_contains_a_resolved_secret(tmp_path, monkeypatch
     # manifest ships in the same bundle. Recording the authored template rather
     # than the substituted value makes that structural instead of a filter.
     from rc_repro.services import capture
-    _write_scenario("login", """
+    _write_workload("login", """
 name: login
 steps:
   - fill: "input[name=pass]"
@@ -2988,7 +2988,7 @@ steps:
     value: hello
 """)
     drv = _FakeDriver()
-    man = capture.run(capture.load_scenario("login"), drv, tmp_path / "cap",
+    man = capture.run(capture.load_workload("login"), drv, tmp_path / "cap",
                       context={"root_url": "http://x:3000", "admin_pass": "hunter2"})
 
     blob = json.dumps(man)
@@ -2999,16 +2999,16 @@ steps:
 
 
 def test_capture_redacts_a_hardcoded_password_value(tmp_path, monkeypatch):
-    # A scenario author who inlines a credential instead of using a placeholder
+    # A workload author who inlines a credential instead of using a placeholder
     # must not put it in an attachable bundle.
     from rc_repro.services import capture
-    _write_scenario("inline", """
+    _write_workload("inline", """
 name: inline
 steps:
   - fill: "input[name=password]"
     value: "s3cr3t-inline"
 """)
-    man = capture.run(capture.load_scenario("inline"), _FakeDriver(), tmp_path / "cap",
+    man = capture.run(capture.load_workload("inline"), _FakeDriver(), tmp_path / "cap",
                       context={"root_url": "http://x:3000"})
     assert "s3cr3t-inline" not in json.dumps(man)
     assert man["steps"][0]["value"] == "REDACTED"
@@ -3052,7 +3052,7 @@ def test_evidence_readme_embeds_capture_artifacts(tmp_path, monkeypatch):
     cap = tmp_path / "b" / "capture"
     cap.mkdir(parents=True)
     (cap / "manifest.json").write_text(json.dumps({
-        "scenario": "smoke", "status": "ok",
+        "workload": "smoke", "status": "ok",
         "steps": [{"index": 0, "action": "goto", "target": "/", "status": "ok"}],
         "shots": ["01-landing.png"], "video": "video.webm", "trace": "trace.zip",
         "failed_step": None,
@@ -3102,7 +3102,7 @@ def test_capture_honours_timeout_ms_on_every_waiting_action(tmp_path):
     # click during a slow boot would fail at the default and report "your selectors
     # may have moved" when the real cause was the clock.
     from rc_repro.services import capture
-    _write_scenario("slow", """
+    _write_workload("slow", """
 name: slow
 steps:
   - click: "button.a"
@@ -3115,7 +3115,7 @@ steps:
   - click: "button.d"
 """)
     drv = _FakeDriver()
-    capture.run(capture.load_scenario("slow"), drv, tmp_path / "cap", context={})
+    capture.run(capture.load_workload("slow"), drv, tmp_path / "cap", context={})
     assert drv.calls == [
         ("click", "button.a", 60000),
         ("fill", "input.b", "x", 45000),
@@ -3130,7 +3130,7 @@ def test_capture_redacts_a_secret_embedded_in_an_unremarkable_field(tmp_path):
     # it stays readable. A literal copy of the real secret is not safe, and the
     # selector-name rule cannot catch it in a field called "note".
     from rc_repro.services import capture
-    _write_scenario("embed", """
+    _write_workload("embed", """
 name: embed
 steps:
   - fill: "textarea#note"
@@ -3138,7 +3138,7 @@ steps:
   - fill: "textarea#pasted"
     value: "the password is hunter2"
 """)
-    man = capture.run(capture.load_scenario("embed"), _FakeDriver(), tmp_path / "cap",
+    man = capture.run(capture.load_workload("embed"), _FakeDriver(), tmp_path / "cap",
                       context={"admin_pass": "hunter2"})
 
     assert "hunter2" not in json.dumps(man)
@@ -3185,7 +3185,7 @@ def test_evidence_readme_flags_a_failed_capture(tmp_path, monkeypatch):
     cap = tmp_path / "b" / "capture"
     cap.mkdir(parents=True)
     (cap / "manifest.json").write_text(json.dumps({
-        "scenario": "drift", "status": "failed",
+        "workload": "drift", "status": "failed",
         "steps": [{"index": 0, "action": "click", "target": "button.gone",
                    "status": "failed"}],
         "shots": [], "video": None, "trace": None,
@@ -3198,13 +3198,13 @@ def test_evidence_readme_flags_a_failed_capture(tmp_path, monkeypatch):
 
 
 def test_capture_bundle_is_written_even_when_the_capture_fails(tmp_path, monkeypatch):
-    # The ordering is the point: a drifted scenario must still leave the README whose
+    # The ordering is the point: a drifted workload must still leave the README whose
     # banner explains where it stopped. Losing the bundle on failure would throw away
     # exactly the artifacts that show what went wrong.
     from rc_repro.services import capture, k8s
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
     k8s.create_repro("cb1", "8.6.1", offline=True, port=31409, run=_FakeRun())
-    _write_scenario("drift", """
+    _write_workload("drift", """
 name: drift
 steps:
   - goto: "/"
@@ -3229,7 +3229,7 @@ def test_capture_bundle_returns_the_payload_on_success(tmp_path, monkeypatch):
     from rc_repro.services import capture, k8s
     monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
     k8s.create_repro("cb2", "8.6.1", offline=True, port=31410, run=_FakeRun())
-    _write_scenario("ok", """
+    _write_workload("ok", """
 name: ok
 steps:
   - goto: "/"

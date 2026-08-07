@@ -2765,11 +2765,11 @@ def evidence(
 
 
 @app.command()
-def captures() -> None:
-    """List the browser capture scenarios available here."""
-    rows = capturesvc.list_scenarios()
+def workloads() -> None:
+    """List the capture workloads available here."""
+    rows = capturesvc.list_workloads()
     if not rows:
-        ui.warn("no capture scenarios found")
+        ui.warn("no capture workloads found")
         return
     for row in rows:
         ui.ok(f"  {row['name']:16} {row['description'] or ''}")
@@ -2780,8 +2780,8 @@ def captures() -> None:
 @app.command()
 def capture(
     name: str = typer.Option("", "--name", "-n"),
-    scenario: str = typer.Option("smoke", "--scenario",
-                                 help="scenario to drive (see `rc-repro captures`)"),
+    workload: str = typer.Option("smoke", "--workload",
+                                 help="workload to drive (see `rc-repro workloads`)"),
     bundle: str = typer.Option("", "--bundle",
                                help="bundle directory to write; defaults under ~/.rc-repro/reports"),
     json_out: bool = typer.Option(True, "--json/--no-json"),
@@ -2797,7 +2797,7 @@ def capture(
     """
     payload: dict = {}
     try:
-        payload = capturesvc.capture_bundle(name, scenario, bundle)
+        payload = capturesvc.capture_bundle(name, workload, bundle)
     except errors.ReproError as exc:
         jsonout.fail(exc) if json_out else _fail(exc)
     if json_out:

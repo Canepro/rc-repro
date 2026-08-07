@@ -31,7 +31,7 @@ rc-repro = "rc_repro.cli:app"
 packages = ["rc_repro", "rc_repro.presets", "rc_repro.perf", "rc_repro.services", "rc_repro.web"]
 
 [tool.setuptools.package-data]
-rc_repro = ["data/*.yaml", "data/presets/*.yaml", "data/captures/*.yaml", "data/monitoring/*.json", "data/loadtest/*.js", "data/webui/*", "data/skill/*.md"]
+rc_repro = ["data/*.yaml", "data/presets/*.yaml", "data/workloads/*.yaml", "data/monitoring/*.json", "data/loadtest/*.js", "data/webui/*", "data/skill/*.md"]
 
 [tool.ruff]
 line-length = 110

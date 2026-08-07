@@ -895,7 +895,7 @@ rc-repro api --name test --2fa  POST /api/v1/settings/<id> -d '{"value":true}'
 | `prune` | delete all `down` repros, then the empty rc-repro-owned Kind cluster (confirms first, `--yes` to skip) |
 | `evidence` | a secret-safe, backend-neutral record of what was deployed and how it is behaving; `--bundle <dir>` also writes logs, the rendered artifact, and a `README.md` a person can read |
 | `capture` | drive a scripted reproduction in a browser and write an attachable bundle: screenshot per checkpoint, video, Playwright trace, evidence record, README (needs `pip install 'rc-repro[capture]'`) |
-| `captures` | list available capture scenarios |
+| `workloads` | list available capture workloads |
 | `capabilities` | what this build can do (contract version, commands, phases, error/exit codes, presets, topologies); the discovery call an agent reads first |
 | `onboard` | inspect the machine and answer owned-cluster, conditional engine-resize, and retention questions once; `--accept-defaults` is for non-interactive automation |
 | `skill install` / `skill status` | install the versioned rc-repro agent skill into an agent host (`claude`, `codex`; Cursor and Copilot read those) |
@@ -915,8 +915,8 @@ command:
 ```bash
 pip install 'rc-repro[capture]' && playwright install chromium
 
-rc-repro captures                                       # list scenarios
-rc-repro capture --name my-repro --scenario smoke       # run one
+rc-repro workloads                                      # list workloads
+rc-repro capture --name my-repro --workload smoke       # run one
 ```
 
 The bundle contains a screenshot per named checkpoint, a video of the run, a
@@ -924,9 +924,9 @@ Playwright trace (`npx playwright show-trace capture/trace.zip`), the evidence
 record, and a `README.md` linking them together. That README is the file you
 attach; the JSON stays authoritative for scripts.
 
-Write a scenario for your own reproduction by copying the built-in `smoke` into
-`~/.rc-repro/captures/<name>.yaml`. A user file overrides a built-in of the same
-name, which is also how you repair a shipped scenario after a UI change:
+Write a workload for your own reproduction by copying the built-in `smoke` into
+`~/.rc-repro/workloads/<name>.yaml`. A user file overrides a built-in of the same
+name, which is also how you repair a shipped workload after a UI change:
 
 ```yaml
 name: my-repro
@@ -947,7 +947,7 @@ steps:
 Two things worth knowing:
 
 **A capture that cannot finish fails (exit 9).** rc-repro runs version-matched
-repros and Rocket.Chat's selectors move between versions, so a scenario authored
+repros and Rocket.Chat's selectors move between versions, so a workload authored
 against one version may find nothing on another. Rather than shooting a blank page
 that still looks like evidence, the run stops and the manifest names the step that
 could not run.

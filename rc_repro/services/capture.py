@@ -9,16 +9,16 @@ who was not in the session can actually look at.
 Three properties are load-bearing, and none of them is incidental:
 
 * **Failure is loud.** rc-repro exists to run *version-matched* repros, and
-  Rocket.Chat's selectors move between versions. A scenario authored against 8.5.1
+  Rocket.Chat's selectors move between versions. A workload authored against 8.5.1
   and pointed at 7.10.11 will find nothing, and a blank screenshot is worse than no
   screenshot because it still looks like evidence. A step that cannot run aborts
   the capture, names itself in the manifest, and exits non-zero.
-* **The manifest records the scenario as authored, never as resolved.** A step
+* **The manifest records the workload as authored, never as resolved.** A step
   filling `{{admin_pass}}` is recorded with the placeholder intact. Evidence's
   contract is that no password appears anywhere in an attachable bundle, and
   keeping substitution out of the record makes that structural rather than a
   filter someone has to remember to run.
-* **The browser is injected.** The scenario runner holds the ordering, redaction,
+* **The browser is injected.** The workload runner holds the ordering, redaction,
   and failure logic worth testing; a real browser in that path would only make it
   slow and flaky. `browser_driver()` builds the Playwright one, tests pass a fake.
 
@@ -39,7 +39,7 @@ import yaml
 from rc_repro import config
 from rc_repro.errors import CaptureFailedError, ReproError, ValidationError
 
-#: Actions a scenario step may take. Deliberately small: every one of these maps to
+#: Actions a workload step may take. Deliberately small: every one of these maps to
 #: a single Playwright call, so the DSL cannot drift into being a worse programming
 #: language. `selector` is a raw Playwright selector on purpose — it is the escape
 #: hatch that keeps an unusual reproduction from being blocked on this file growing
@@ -49,14 +49,14 @@ ACTIONS = ("goto", "click", "fill", "press", "wait_for", "shot")
 #: Keys a step may carry alongside its action.
 _MODIFIERS = ("value", "timeout_ms")
 
-#: Selectors whose typed value must never reach the manifest. A scenario author who
+#: Selectors whose typed value must never reach the manifest. A workload author who
 #: inlines a credential instead of using a `{{placeholder}}` should not be able to
 #: put it in a bundle that goes to a support case.
 _PASSWORDISH = re.compile(r"pass|pwd|secret|token|otp", re.I)
 
 _DEFAULT_TIMEOUT_MS = 15000
 
-#: Viewport pinned so two runs of the same scenario produce comparable frames, and
+#: Viewport pinned so two runs of the same workload produce comparable frames, and
 #: so a screenshot filed against a ticket is not sized by whoever ran it.
 VIEWPORT = {"width": 1280, "height": 800}
 
@@ -70,24 +70,24 @@ class Step:
 
 
 @dataclass(frozen=True)
-class Scenario:
+class Workload:
     name: str
     description: str = ""
     steps: tuple[Step, ...] = field(default_factory=tuple)
 
 
-def _parse(text: str, source: str) -> Scenario:
+def _parse(text: str, source: str) -> Workload:
     try:
         raw = yaml.safe_load(text) or {}
     except yaml.YAMLError as exc:
-        raise ValidationError(f"scenario {source} is not valid YAML: {exc}") from exc
+        raise ValidationError(f"workload {source} is not valid YAML: {exc}") from exc
     if not isinstance(raw, dict):
-        raise ValidationError(f"scenario {source} must be a mapping")
+        raise ValidationError(f"workload {source} must be a mapping")
 
     steps = []
     for i, item in enumerate(raw.get("steps") or []):
         if not isinstance(item, dict):
-            raise ValidationError(f"scenario {source} step {i} must be a mapping")
+            raise ValidationError(f"workload {source} step {i} must be a mapping")
         actions = [k for k in item if k in ACTIONS]
         unknown = [k for k in item if k not in ACTIONS and k not in _MODIFIERS]
         if unknown:
@@ -95,50 +95,50 @@ def _parse(text: str, source: str) -> Scenario:
             # one interaction the reproduction depends on while still producing
             # screenshots, which reads as proof.
             raise ValidationError(
-                f"scenario {source} step {i}: unknown key {unknown[0]!r} "
+                f"workload {source} step {i}: unknown key {unknown[0]!r} "
                 f"(actions: {', '.join(ACTIONS)})")
         if len(actions) != 1:
             raise ValidationError(
-                f"scenario {source} step {i} must name exactly one action "
+                f"workload {source} step {i} must name exactly one action "
                 f"({', '.join(ACTIONS)})")
 
         action = actions[0]
         target = str(item[action] or "").strip()
         if not target:
-            raise ValidationError(f"scenario {source} step {i}: {action} needs a target")
+            raise ValidationError(f"workload {source} step {i}: {action} needs a target")
         value = item.get("value")
         if action == "fill" and value is None:
-            raise ValidationError(f"scenario {source} step {i}: fill needs a value")
+            raise ValidationError(f"workload {source} step {i}: fill needs a value")
         steps.append(Step(action=action, target=target, value=str(value or ""),
                           timeout_ms=int(item.get("timeout_ms") or 0)))
 
-    return Scenario(name=str(raw.get("name") or "").strip() or "unnamed",
+    return Workload(name=str(raw.get("name") or "").strip() or "unnamed",
                     description=str(raw.get("description") or "").strip(),
                     steps=tuple(steps))
 
 
-def load_scenario(name: str) -> Scenario:
-    """Return a scenario by name.
+def load_workload(name: str) -> Workload:
+    """Return a workload by name.
 
-    A user file (`~/.rc-repro/captures/<name>.yaml`) wins over the built-in, the
-    same precedence presets use: when a shipped scenario drifts against a new
+    A user file (`~/.rc-repro/workloads/<name>.yaml`) wins over the built-in, the
+    same precedence presets use: when a shipped workload drifts against a new
     Rocket.Chat release, it can be fixed locally without waiting for a release.
     """
-    user = config.capture_dir() / f"{name}.yaml"
+    user = config.workload_dir() / f"{name}.yaml"
     if user.exists():
         return _parse(user.read_text(encoding="utf-8"), source=str(user))
 
-    builtin = resources.files("rc_repro").joinpath("data", "captures", f"{name}.yaml")
+    builtin = resources.files("rc_repro").joinpath("data", "workloads", f"{name}.yaml")
     if not builtin.is_file():
         raise ValidationError(
-            f"unknown scenario {name!r} (run `rc-repro captures` to list)")
+            f"unknown workload {name!r} (run `rc-repro workloads` to list)")
     return _parse(builtin.read_text(encoding="utf-8"), source="built-in")
 
 
-def list_scenarios() -> list[dict]:
-    """Every scenario available here, built-in and user, user winning on name."""
+def list_workloads() -> list[dict]:
+    """Every workload available here, built-in and user, user winning on name."""
     found: dict[str, dict] = {}
-    builtin_dir = resources.files("rc_repro").joinpath("data", "captures")
+    builtin_dir = resources.files("rc_repro").joinpath("data", "workloads")
     if builtin_dir.is_dir():
         for entry in builtin_dir.iterdir():
             if entry.name.endswith(".yaml"):
@@ -146,7 +146,7 @@ def list_scenarios() -> list[dict]:
                 found[stem] = {"name": stem, "source": "built-in",
                                "description": _parse(entry.read_text(encoding="utf-8"),
                                                      "built-in").description}
-    d = config.capture_dir()
+    d = config.workload_dir()
     if d.is_dir():
         for entry in sorted(d.glob("*.yaml")):
             found[entry.stem] = {"name": entry.stem, "source": str(entry),
@@ -197,12 +197,12 @@ def _apply(step: Step, driver, root: str, context: dict, dest: Path, shots: list
         shots.append(name)
 
 
-def run(scenario: Scenario, driver, dest: str | Path, context: dict | None = None) -> dict:
-    """Execute a scenario, write its artifacts and manifest into `dest`.
+def run(workload: Workload, driver, dest: str | Path, context: dict | None = None) -> dict:
+    """Execute a workload, write its artifacts and manifest into `dest`.
 
     Raises `CaptureFailedError` if any step could not run. The manifest is written
     either way, because a failed capture's partial artifacts are exactly what tells
-    you *where* a scenario drifted; what must not happen is a run that failed
+    you *where* a workload drifted; what must not happen is a run that failed
     halfway reporting success.
     """
     dest = Path(dest).expanduser()
@@ -215,7 +215,7 @@ def run(scenario: Scenario, driver, dest: str | Path, context: dict | None = Non
     failed: dict | None = None
     secrets = secret_values(context)
     try:
-        for i, step in enumerate(scenario.steps):
+        for i, step in enumerate(workload.steps):
             rec = {"index": i, "action": step.action, "target": step.target, "status": "ok"}
             if step.action == "fill":
                 value = _recorded_value(step)
@@ -238,8 +238,8 @@ def run(scenario: Scenario, driver, dest: str | Path, context: dict | None = Non
         artifacts = _finish(driver)
 
     manifest = {
-        "scenario": scenario.name,
-        "description": scenario.description,
+        "workload": workload.name,
+        "description": workload.description,
         "status": "failed" if failed else "ok",
         "steps": steps_out,
         "shots": shots,
@@ -254,15 +254,15 @@ def run(scenario: Scenario, driver, dest: str | Path, context: dict | None = Non
         raise CaptureFailedError(
             f"capture stopped at step {failed['index']} ({failed['action']} "
             f"{failed['target']!r}): {failed.get('error', '')}. "
-            f"If the scenario was written for another Rocket.Chat version, its "
+            f"If the workload was written for another Rocket.Chat version, its "
             f"selectors may have moved.",
             details={"manifest": str(dest / "manifest.json")})
     return manifest
 
 
-def capture_bundle(name: str, scenario: str, dest: str | Path = "",
+def capture_bundle(name: str, workload: str, dest: str | Path = "",
                    driver_factory=None) -> dict:
-    """Run a scenario against a repro and write the complete attachable bundle.
+    """Run a workload against a repro and write the complete attachable bundle.
 
     Here rather than in the CLI because both front-ends need the same sequence, and
     because the ordering is load-bearing in a way worth testing: the evidence bundle
@@ -272,11 +272,11 @@ def capture_bundle(name: str, scenario: str, dest: str | Path = "",
     """
     from rc_repro.services import evidence, lifecycle
 
-    scen = load_scenario(scenario)
+    wl = load_workload(workload)
     info = lifecycle.describe(name)
     repro_name = info["name"]
     out = Path(dest).expanduser() if dest else \
-        config.reports_dir() / f"{repro_name}-{scenario}"
+        config.reports_dir() / f"{repro_name}-{workload}"
     context = {"root_url": info["root_url"],
                "admin_user": info["login"]["user"],
                "admin_pass": info["login"]["password"]}
@@ -285,7 +285,7 @@ def capture_bundle(name: str, scenario: str, dest: str | Path = "",
     driver = factory(info["root_url"], out / "capture", secret_values(context))
     failure: CaptureFailedError | None = None
     try:
-        run(scen, driver, out / "capture", context=context)
+        run(wl, driver, out / "capture", context=context)
     except CaptureFailedError as exc:
         failure = exc
 
@@ -310,7 +310,7 @@ def render_section(manifest: dict) -> list[str]:
         lines += [f"> **This capture did not complete.** It stopped at step "
                   f"{failed.get('index')} (`{failed.get('action')} "
                   f"{failed.get('target')}`). Treat the artifacts below as partial, "
-                  f"not as proof of the behaviour. A scenario written for another "
+                  f"not as proof of the behaviour. A workload written for another "
                   f"Rocket.Chat version is the usual cause.", ""]
 
     lines += ["| # | Action | Target | Value | |", "|---|---|---|---|---|"]
@@ -335,7 +335,7 @@ def render_section(manifest: dict) -> list[str]:
                      f"`npx playwright show-trace capture/{manifest['trace']}`)")
     if not media:
         # Stated rather than omitted: a silently missing recording reads as a
-        # scenario that did not ask for one.
+        # workload that did not ask for one.
         media.append("- No video or trace was produced for this run.")
     lines += ["## Recording", ""] + media + [""]
     return lines
@@ -418,9 +418,9 @@ def browser_driver(root_url: str, dest: str | Path, secrets: tuple[str, ...] = (
 class _PlaywrightDriver:
     """The real browser. Thin on purpose: every method is one Playwright call.
 
-    Kept free of scenario logic so the part with branching stays testable without a
+    Kept free of workload logic so the part with branching stays testable without a
     browser. `reduced_motion` and a pinned viewport are set so repeated runs of the
-    same scenario produce comparable frames rather than diffs made of animation.
+    same workload produce comparable frames rather than diffs made of animation.
     """
 
     def __init__(self, sync_playwright, root_url: str, dest: Path,

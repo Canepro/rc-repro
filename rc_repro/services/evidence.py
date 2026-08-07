@@ -265,7 +265,7 @@ def render_markdown(payload: dict, capture: dict | None = None) -> str:
     if not capture:
         lines += ["No scripted capture was run, so this bundle proves what was "
                   "deployed but not what was done to it. Add one with "
-                  f"`rc-repro capture --name {name} --scenario smoke`.", ""]
+                  f"`rc-repro capture --name {name} --workload smoke`.", ""]
     else:
         from rc_repro.services import capture as capturesvc
         lines += capturesvc.render_section(capture)

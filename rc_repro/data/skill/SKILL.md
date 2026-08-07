@@ -103,8 +103,8 @@ Evidence proves what was deployed. It does not prove *do X, then Y goes wrong*,
 which is the shape of nearly every escalation. For that, drive the reproduction:
 
 ```
-rc-repro captures                                        # list scenarios
-rc-repro capture --name <name> --scenario smoke --json   # screenshots + video + trace
+rc-repro workloads                                       # list workloads
+rc-repro capture --name <name> --workload smoke --json   # screenshots + video + trace
 ```
 
 This writes a complete attachable bundle in one command: a screenshot per
@@ -113,16 +113,16 @@ them. It needs the optional extra (`pip install 'rc-repro[capture]'` then
 `playwright install chromium`); without it the command says so rather than failing
 obscurely.
 
-Author a scenario for the specific behaviour by copying the built-in `smoke` into
-`~/.rc-repro/captures/<name>.yaml` and editing its steps. A user file overrides a
-built-in of the same name, which is also how you repair a shipped scenario whose
+Author a workload for the specific behaviour by copying the built-in `smoke` into
+`~/.rc-repro/workloads/<name>.yaml` and editing its steps. A user file overrides a
+built-in of the same name, which is also how you repair a shipped workload whose
 selectors moved.
 
 Two rules when reading the result:
 
 - **Exit 9 means the capture did not complete.** A step whose selector did not
   match aborts the run rather than shooting a blank page. The usual cause is a
-  scenario written for a different Rocket.Chat version. Fix the selector; do not
+  workload written for a different Rocket.Chat version. Fix the selector; do not
   retry unchanged and do not present partial artifacts as proof of the behaviour.
 - **Use placeholders, never literals, for credentials.** `{{admin_user}}` and
   `{{admin_pass}}` are substituted for the browser but recorded unresolved, so the
