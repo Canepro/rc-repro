@@ -952,6 +952,11 @@ against one version may find nothing on another. Rather than shooting a blank pa
 that still looks like evidence, the run stops and the manifest names the step that
 could not run.
 
+**A rerun will not quietly replace a bundle.** If the target directory already
+holds one, `capture` stops with exit 8 before starting the browser. A bundle is
+evidence and its README usually carries observed behaviour written by hand, so
+replacing it takes an explicit `--force`.
+
 **Credentials go in as `{{placeholders}}`.** They are substituted for the browser
 but recorded unresolved, so the manifest describes what happened without carrying a
 secret. A literal typed into a password field is redacted, and the Playwright trace

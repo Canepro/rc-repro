@@ -37,7 +37,8 @@ from pathlib import Path
 import yaml
 
 from rc_repro import config
-from rc_repro.errors import CaptureFailedError, ReproError, ValidationError
+from rc_repro.errors import (CaptureFailedError, ConflictError, ReproError,
+                             ValidationError)
 
 #: Actions a workload step may take. Deliberately small: every one of these maps to
 #: a single Playwright call, so the DSL cannot drift into being a worse programming
@@ -260,8 +261,34 @@ def run(workload: Workload, driver, dest: str | Path, context: dict | None = Non
     return manifest
 
 
+#: Files whose presence means a directory already holds a bundle. Only these
+#: block a write: an empty or incidentally-populated directory is not evidence,
+#: so refusing there would be friction that protects nothing.
+_BUNDLE_MARKERS = ("README.md", "manifest.json")
+
+
+def _refuse_to_replace(dest: Path, force: bool) -> None:
+    """Stop before overwriting a bundle that already exists.
+
+    A bundle is evidence, and the drill has a human hand-write the observed
+    behaviour into its README. A rerun cannot restore that, so replacing it has to
+    be something the operator asks for rather than something a repeated command
+    does quietly. Checked before the browser starts, so a refusal costs nothing and
+    leaves no partial artifacts behind.
+    """
+    if force:
+        return
+    found = [m for m in _BUNDLE_MARKERS if (dest / m).exists()]
+    if not found:
+        return
+    raise ConflictError(
+        f"{dest} already holds a bundle ({', '.join(found)}). Writing here would "
+        f"replace it, including anything written into its README by hand. Pass a "
+        f"different --bundle, or --force to replace it.")
+
+
 def capture_bundle(name: str, workload: str, dest: str | Path = "",
-                   driver_factory=None) -> dict:
+                   driver_factory=None, force: bool = False) -> dict:
     """Run a workload against a repro and write the complete attachable bundle.
 
     Here rather than in the CLI because both front-ends need the same sequence, and
@@ -277,6 +304,7 @@ def capture_bundle(name: str, workload: str, dest: str | Path = "",
     repro_name = info["name"]
     out = Path(dest).expanduser() if dest else \
         config.reports_dir() / f"{repro_name}-{workload}"
+    _refuse_to_replace(out, force)
     context = {"root_url": info["root_url"],
                "admin_user": info["login"]["user"],
                "admin_pass": info["login"]["password"]}

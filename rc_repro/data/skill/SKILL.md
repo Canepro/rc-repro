@@ -124,6 +124,10 @@ Two rules when reading the result:
   match aborts the run rather than shooting a blank page. The usual cause is a
   workload written for a different Rocket.Chat version. Fix the selector; do not
   retry unchanged and do not present partial artifacts as proof of the behaviour.
+- **Exit 8 means a bundle is already there.** `capture` refuses to replace one
+  before it starts the browser, because a bundle's README usually carries
+  observed behaviour written by hand. Choose another `--bundle`, or pass
+  `--force` when replacing it is what you actually want.
 - **Use placeholders, never literals, for credentials.** `{{admin_user}}` and
   `{{admin_pass}}` are substituted for the browser but recorded unresolved, so the
   bundle stays attachable. A literal typed into a password field is redacted, and

@@ -3241,3 +3241,67 @@ steps:
     md = (Path(payload["bundle"]["path"]) / "README.md").read_text()
     assert "![01-landing](capture/01-landing.png)" in md
     assert "admin123" not in md
+
+
+def test_capture_bundle_refuses_to_replace_an_existing_bundle(tmp_path, monkeypatch):
+    # A bundle is evidence, and the drill has a human hand-write the actual-behaviour
+    # line into its README. Silently overwriting that destroys work no rerun restores.
+    from rc_repro.services import capture, k8s
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    k8s.create_repro("ov1", "8.6.1", offline=True, port=31411, run=_FakeRun())
+    _write_workload("ok", """
+name: ok
+steps:
+  - goto: "/"
+""")
+    dest = tmp_path / "b"
+    dest.mkdir()
+    (dest / "README.md").write_text("hand-written actual behaviour", encoding="utf-8")
+
+    built = []
+    with pytest.raises(errors.ConflictError) as ei:
+        capture.capture_bundle("ov1", "ok", dest,
+                               driver_factory=lambda *a, **k: built.append(1) or _FakeDriver())
+
+    assert not built, "must refuse before launching a browser"
+    assert not (dest / "capture").exists(), "must not write artifacts before refusing"
+    assert (dest / "README.md").read_text() == "hand-written actual behaviour"
+    assert "--force" in str(ei.value)
+    assert ei.value.exit_code == 8
+
+
+def test_capture_bundle_replaces_an_existing_bundle_when_forced(tmp_path, monkeypatch):
+    from rc_repro.services import capture, k8s
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    k8s.create_repro("ov2", "8.6.1", offline=True, port=31412, run=_FakeRun())
+    _write_workload("ok2", """
+name: ok2
+steps:
+  - goto: "/"
+  - shot: landing
+""")
+    dest = tmp_path / "b2"
+    dest.mkdir()
+    (dest / "README.md").write_text("stale", encoding="utf-8")
+
+    payload = capture.capture_bundle("ov2", "ok2", dest, force=True,
+                                     driver_factory=lambda *a, **k: _FakeDriver())
+    assert "README.md" in payload["bundle"]["files"]
+    assert "stale" not in (dest / "README.md").read_text()
+
+
+def test_capture_bundle_writes_into_a_directory_holding_unrelated_files(tmp_path, monkeypatch):
+    # Only a bundle marker blocks. An empty or incidentally-populated directory is
+    # not evidence, so refusing there would be friction with no protection.
+    from rc_repro.services import capture, k8s
+    monkeypatch.setenv("RC_REPRO_HOME", str(tmp_path / "home"))
+    k8s.create_repro("ov3", "8.6.1", offline=True, port=31413, run=_FakeRun())
+    _write_workload("ok3", "name: ok3\nsteps:\n  - goto: \"/\"\n")
+    dest = tmp_path / "b3"
+    dest.mkdir()
+    (dest / "notes.txt").write_text("scratch", encoding="utf-8")
+
+    payload = capture.capture_bundle("ov3", "ok3", dest,
+                                     driver_factory=lambda *a, **k: _FakeDriver())
+    assert "README.md" in payload["bundle"]["files"]
+    assert (dest / "notes.txt").exists(), "unrelated files are left alone"

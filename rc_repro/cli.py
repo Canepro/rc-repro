@@ -2784,6 +2784,8 @@ def capture(
                                  help="workload to drive (see `rc-repro workloads`)"),
     bundle: str = typer.Option("", "--bundle",
                                help="bundle directory to write; defaults under ~/.rc-repro/reports"),
+    force: bool = typer.Option(False, "--force",
+                               help="replace an existing bundle at that path"),
     json_out: bool = typer.Option(True, "--json/--no-json"),
 ) -> None:
     """Drive a scripted reproduction in a browser and write an attachable bundle.
@@ -2794,10 +2796,13 @@ def capture(
 
     A step whose selector does not match fails the run (exit 9) rather than
     shooting a blank page, because a half-run capture still looks like proof.
+
+    Refuses to replace an existing bundle (exit 8) unless --force: a bundle is
+    evidence, and its README usually carries observed behaviour written by hand.
     """
     payload: dict = {}
     try:
-        payload = capturesvc.capture_bundle(name, workload, bundle)
+        payload = capturesvc.capture_bundle(name, workload, bundle, force=force)
     except errors.ReproError as exc:
         jsonout.fail(exc) if json_out else _fail(exc)
     if json_out:
